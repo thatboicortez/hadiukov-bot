@@ -1,2 +1,2 @@
 aiogram==3.4.1
-python-dateutil
+python-dateutil==2.9.0.post0
