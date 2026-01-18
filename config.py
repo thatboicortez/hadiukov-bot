@@ -8,7 +8,6 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 PRODUCT_NAME = "Sever by Hadiukov"
 TALLY_FORM_URL = "https://tally.so/r/jao451"
 
-# цены (как ты писал): 50 и 120
 PRICES = {
     "1m": 50,
     "3m": 120,
