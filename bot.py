@@ -16,6 +16,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup,
     KeyboardButton,
     FSInputFile,
+    User,
 )
 
 from config import BOT_TOKEN, TALLY_FORM_URL
@@ -101,18 +102,28 @@ async def send_payment_flow_final(
     period_key: str = "",
     period_text: str = "",
     expires_at: str = "",
+    tg_user: User | None = None,
 ):
     """
     Финальные сообщения после выбора суммы:
     - Crypto: "Для оплаты ... N USDT" + "адрес (в monospace только адрес) + кнопка tally"
     - Fiat: "Для оплаты ... X грн" + "Скоро добавим карту." + кнопка tally
+
+    ВАЖНО:
+    В callback'ах message.from_user == bot (т.к. это сообщение бота),
+    поэтому tg_user нужно передавать как cb.from_user.
     """
     order_id = str(uuid.uuid4())
 
+    # Берём tg_id и tg_username из реального пользователя (tg_user),
+    # иначе fallback на message.from_user (актуально для обычных сообщений от юзера)
+    real_user_id = str(tg_user.id) if tg_user else str(message.from_user.id)
+    real_username = (tg_user.username if tg_user and tg_user.username else (message.from_user.username or ""))
+
     params = {
         "order_id": order_id,
-        "tg_id": str(message.from_user.id),
-        "tg_username": message.from_user.username or "",
+        "tg_id": real_user_id,
+        "tg_username": real_username,
         "product": product,
         "period": period_text,
         "period_key": period_key,
@@ -307,7 +318,6 @@ async def products_entry(message: Message):
 # --- Products menu choices ---
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
-    # Нижняя клавиатура уже products_menu_kb() и останется пока не вернем main_menu_kb()
     await message.answer("Объяснение внутрянки сервера", reply_markup=kb_community_buy())
 
 @dp.message(F.text == "Hadiukov Mentoring")
@@ -409,6 +419,7 @@ async def subscription_selected(cb: CallbackQuery):
                 period_key=period_key,
                 period_text=period_text,
                 expires_at=expires_at,
+                tg_user=cb.from_user,  # ✅ ВАЖНО: реальный пользователь
             )
         else:
             amount = COMMUNITY_UAH_1M if choice == "1m" else COMMUNITY_UAH_3M
@@ -421,6 +432,7 @@ async def subscription_selected(cb: CallbackQuery):
                 period_key=period_key,
                 period_text=period_text,
                 expires_at=expires_at,
+                tg_user=cb.from_user,  # ✅ ВАЖНО: реальный пользователь
             )
 
     elif product_key == "mentoring":
@@ -436,6 +448,7 @@ async def subscription_selected(cb: CallbackQuery):
                 period_key="mentoring",
                 period_text="Mentoring",
                 expires_at="",
+                tg_user=cb.from_user,  # ✅ ВАЖНО: реальный пользователь
             )
         else:
             await send_payment_flow_final(
@@ -447,6 +460,7 @@ async def subscription_selected(cb: CallbackQuery):
                 period_key="mentoring",
                 period_text="Mentoring",
                 expires_at="",
+                tg_user=cb.from_user,  # ✅ ВАЖНО: реальный пользователь
             )
 
     await cb.answer()
