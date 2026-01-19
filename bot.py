@@ -33,7 +33,7 @@ INSTAGRAM_URL = "https://www.instagram.com/hadiukov?igsh=MTdtZmp4MmtxdzF2dw=="
 TELEGRAM_URL = "https://t.me/hadiukov"
 
 # Images (пути в репо)
-RESOURCES_IMAGE_PATH = "pictures/resources.png"
+RESOURCES_IMAGE_PATH = "pictures/resources.PNG"
 # Картинка для "Мои продукты" (если нет — просто не покажет фото, не упадет)
 PRODUCTS_IMAGE_PATH = "pictures/products.png"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
