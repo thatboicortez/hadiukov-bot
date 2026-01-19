@@ -5,14 +5,17 @@ from urllib.parse import urlencode, quote_plus
 from dateutil.relativedelta import relativedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message,
     CallbackQuery,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     WebAppInfo,
+    ReplyKeyboardMarkup,
+    KeyboardButton,
 )
+
 import asyncio
 
 from config import (
@@ -40,37 +43,38 @@ def period_from_key(key: str) -> str:
 
 def expires_from_key(key: str) -> str:
     months = int(PERIOD_MONTHS[key])
-    # Можно менять utcnow() на now() если хочешь локальное время
     return (datetime.utcnow() + relativedelta(months=months)).strftime("%Y-%m-%d")
 
 
 def build_tally_url(params: dict) -> str:
-    """
-    Важно:
-    Telegram WebApp добавляет в URL фрагмент #tgWebAppData=...
-    В некоторых сервисах (в т.ч. у тебя в Tally) этот хвост может "прилипать"
-    к последнему query-параметру (например expires_at).
-
-    Решение: добавляем последний параметр _tail=1, чтобы #... прилипал к нему,
-    а expires_at оставался чистым.
-    """
     params = dict(params)
-    params["_tail"] = "1"  # <- специально последним
-
+    params["_tail"] = "1"  # чтобы #tgWebAppData не прилипал к expires_at
     query = urlencode(params, quote_via=quote_plus)
     return f"{TALLY_FORM_URL}?{query}"
 
 
 # ---------- keyboards ----------
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📦 Мои продукты", callback_data="products")],
-    ])
+def main_menu_kb() -> ReplyKeyboardMarkup:
+    # Это "нижняя клавиатура" (как на твоих скринах)
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [
+                KeyboardButton(text="ℹ️ Информация"),
+                KeyboardButton(text="❓ Помощь"),
+            ],
+            [
+                KeyboardButton(text="📦 Мои продукты"),
+                KeyboardButton(text="🌐 Мои ресурсы"),
+            ],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,   # стараемся держать её постоянно
+        selective=False,
+    )
 
 
 def periods_kb() -> InlineKeyboardMarkup:
-    # делаем кнопки строго из PERIOD_TEXT + PRICES, без хардкода
     rows = []
     for key in ["1m", "3m"]:
         text = f"{PERIOD_TEXT[key]} — {PRICES[key]} USDT"
@@ -87,30 +91,63 @@ def pay_kb(period_key: str) -> InlineKeyboardMarkup:
 
 
 def webapp_kb(tally_url: str) -> InlineKeyboardMarkup:
-    # ВАЖНО: именно WebAppInfo -> откроется как мини-приложение внутри Telegram
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📝 Подтвердить оплату", web_app=WebAppInfo(url=tally_url))]
     ])
+
+
+# ---------- UI helpers ----------
+
+WELCOME_TEXT = (
+    "Добро пожаловать!\n\n"
+    "Выбери раздел снизу 👇"
+)
+
+async def show_main_menu(message: Message, text: str = WELCOME_TEXT):
+    await message.answer(text, reply_markup=main_menu_kb())
+
+
+async def show_products(message: Message):
+    await message.answer(
+        f"📦 {PRODUCT_NAME}\n\nВыбери период подписки:",
+        reply_markup=periods_kb(),
+    )
 
 
 # ---------- handlers ----------
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    await message.answer(
-        "Привет! Выбери раздел 👇",
-        reply_markup=main_menu_kb(),
-    )
+    await show_main_menu(message)
 
 
-@dp.callback_query(F.data == "products")
-async def products(cb: CallbackQuery):
-    await cb.message.edit_text(
-        f"📦 {PRODUCT_NAME}\n\nВыбери период подписки:",
-        reply_markup=periods_kb(),
-    )
-    await cb.answer()
+@dp.message(Command("menu"))
+async def menu(message: Message):
+    await show_main_menu(message, "Главное меню 👇")
 
+
+# Нажатия на нижние кнопки (ReplyKeyboard) приходят как обычный текст
+@dp.message(F.text == "📦 Мои продукты")
+async def products_from_menu(message: Message):
+    await show_products(message)
+
+
+@dp.message(F.text == "ℹ️ Информация")
+async def info_from_menu(message: Message):
+    await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
+
+
+@dp.message(F.text == "❓ Помощь")
+async def help_from_menu(message: Message):
+    await message.answer("❓ Раздел «Помощь» пока в разработке.")
+
+
+@dp.message(F.text == "🌐 Мои ресурсы")
+async def resources_from_menu(message: Message):
+    await message.answer("🌐 Раздел «Мои ресурсы» пока в разработке.")
+
+
+# --- дальше твоя существующая логика inline-кнопок для продукта ---
 
 @dp.callback_query(F.data.startswith("period:"))
 async def choose_period(cb: CallbackQuery):
@@ -130,7 +167,11 @@ async def choose_period(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "back_periods")
 async def back(cb: CallbackQuery):
-    await products(cb)
+    await cb.message.edit_text(
+        f"📦 {PRODUCT_NAME}\n\nВыбери период подписки:",
+        reply_markup=periods_kb(),
+    )
+    await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("pay:"))
@@ -149,11 +190,11 @@ async def pay(cb: CallbackQuery):
         "tg_id": str(cb.from_user.id),
         "tg_username": cb.from_user.username or "",
         "product": PRODUCT_NAME,
-        "period": period_text,      # 1 month / 3 months
-        "period_key": period_key,   # 1m / 3m
+        "period": period_text,
+        "period_key": period_key,
         "pay_method": pay_method,
-        "amount_usdt": str(amount), # 50 / 120
-        "expires_at": expires_at,   # YYYY-MM-DD (чистый)
+        "amount_usdt": str(amount),
+        "expires_at": expires_at,
     }
 
     tally_url = build_tally_url(params)
@@ -170,7 +211,6 @@ async def pay(cb: CallbackQuery):
 
 async def main():
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
