@@ -67,6 +67,9 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
                 KeyboardButton(text="📦 Мои продукты"),
                 KeyboardButton(text="🌐 Мои ресурсы"),
             ],
+             [
+                KeyboardButton(text="👤 Личный кабинет"),
+            ],
         ],
         resize_keyboard=True,
         is_persistent=True,   # стараемся держать её постоянно
@@ -147,6 +150,11 @@ async def resources_from_menu(message: Message):
     await message.answer("🌐 Раздел «Мои ресурсы» пока в разработке.")
 
 
+@dp.message(F.text == "👤 Личный кабинет")
+async def resources_from_menu(message: Message):
+    await message.answer("👤 Раздел «Личный кабинет.")
+
+
 # --- дальше твоя существующая логика inline-кнопок для продукта ---
 
 @dp.callback_query(F.data.startswith("period:"))
@@ -214,3 +222,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
