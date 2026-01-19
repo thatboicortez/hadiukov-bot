@@ -35,7 +35,7 @@ TELEGRAM_URL = "https://t.me/hadiukov"
 # Images (пути в репо)
 RESOURCES_IMAGE_PATH = "pictures/resources.PNG"
 # Картинка для "Мои продукты" (если нет — просто не покажет фото, не упадет)
-PRODUCTS_IMAGE_PATH = "pictures/products.png"
+PRODUCTS_IMAGE_PATH = "pictures/products.PNG"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
 SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
 
