@@ -1,7 +1,7 @@
 import uuid
 import asyncio
 from datetime import datetime, date
-from urllib.parse import urlencode, quote_plus
+from urllib.parse import urlencode, quote
 
 import httpx
 from dateutil.relativedelta import relativedelta
@@ -19,11 +19,13 @@ from aiogram.types import (
     FSInputFile,
 )
 
-from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID, ADMIN_USERNAME
+from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
 # =========================
 # CONFIG / CONSTANTS
 # =========================
+
+ADMIN_USERNAME = "@name"  # поменяешь потом
 
 # Resources links
 YOUTUBE_URL = "https://youtube.com/@hadiukov?si=vy9gXXiLKeDYIfR_"
@@ -45,6 +47,7 @@ COMMUNITY_USDT_3M = 120
 COMMUNITY_UAH_1M = 2200
 COMMUNITY_UAH_3M = 5200
 
+# Mentoring (не показываем в кабинете, но оставим покупку если нужно)
 MENTORING_USDT = 3000
 MENTORING_UAH = 130000
 
@@ -59,191 +62,162 @@ bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # =========================
-# HELPERS (general)
-# =========================
-
-def expires_from_key(key: str) -> str:
-    months = int(PERIOD_MONTHS[key])
-    return (datetime.utcnow() + relativedelta(months=months)).strftime("%Y-%m-%d")
-
-def build_tally_url(params: dict) -> str:
-    params = dict(params)
-    params["_tail"] = "1"  # чтобы tgWebAppData не прилипал к последнему параметру
-    query = urlencode(params, quote_via=quote_plus)
-    return f"{TALLY_FORM_URL}?{query}"
-
-async def send_photo_safe(message: Message, path: str, caption: str | None = None, reply_markup=None):
-    """
-    Пытаемся отправить локальную картинку.
-    Если файла нет/ошибка — отправим просто текст, чтобы бот не падал.
-    """
-    try:
-        photo = FSInputFile(path)
-        await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
-    except Exception:
-        await message.answer(caption or " ", reply_markup=reply_markup)
-
-def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
-    ])
-
-def safe_get_rich_text(props: dict, key: str) -> str:
-    """
-    Поддержка Text properties в Notion: { "rich_text": [...] }
-    """
-    try:
-        p = props.get(key, {})
-        rt = p.get("rich_text", [])
-        if not rt:
-            return ""
-        return "".join([x.get("plain_text", "") for x in rt]).strip()
-    except Exception:
-        return ""
-
-def safe_get_status(props: dict, key: str) -> str:
-    """
-    Notion Status property: { "status": { "name": "pending" } }
-    """
-    try:
-        p = props.get(key, {})
-        st = p.get("status")
-        if not st:
-            return ""
-        return (st.get("name") or "").strip()
-    except Exception:
-        return ""
-
-def format_date_ddmmyyyy(iso_yyyy_mm_dd: str) -> str:
-    """
-    '2026-01-21' -> '21.01.2026'
-    """
-    try:
-        d = datetime.strptime(iso_yyyy_mm_dd.strip(), "%Y-%m-%d").date()
-        return d.strftime("%d.%m.%Y")
-    except Exception:
-        return iso_yyyy_mm_dd.strip()
-
-def is_future_or_today(iso_yyyy_mm_dd: str) -> bool:
-    try:
-        d = datetime.strptime(iso_yyyy_mm_dd.strip(), "%Y-%m-%d").date()
-        return d >= date.today()
-    except Exception:
-        return False
-
-# =========================
-# NOTION API
+# NOTION (READ ONLY)
 # =========================
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-async def notion_query_by_tg_id(tg_id: str, limit: int = 20) -> list[dict]:
-    """
-    Берём записи пользователя по tg_id, сортируем по created_time (самое новое сверху).
-    """
+
+async def notion_query_database(filter_obj: dict, page_size: int = 20) -> dict:
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-
     payload = {
-        "filter": {
-            "property": "tg_id",
-            "rich_text": {"equals": tg_id},
-        },
-        "sorts": [
-            {"timestamp": "created_time", "direction": "descending"}
-        ],
-        "page_size": limit,
+        "filter": filter_obj,
+        "page_size": page_size,
     }
 
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(url, headers=headers, json=payload)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Notion query error {r.status_code}: {r.text}")
-        data = r.json()
-        return data.get("results", [])
+        r.raise_for_status()
+        return r.json()
 
-def pick_latest_records(records: list[dict]) -> dict:
+
+def notion_get_text_prop(page: dict, prop_name: str) -> str:
+    """Поддерживает Text (rich_text) и Title."""
+    props = page.get("properties", {})
+    p = props.get(prop_name)
+    if not p:
+        return ""
+    t = p.get("type")
+    if t == "rich_text":
+        arr = p.get("rich_text", [])
+        return arr[0].get("plain_text", "") if arr else ""
+    if t == "title":
+        arr = p.get("title", [])
+        return arr[0].get("plain_text", "") if arr else ""
+    if t == "email":
+        return p.get("email") or ""
+    return ""
+
+
+def notion_get_status(page: dict, prop_name: str) -> str:
+    props = page.get("properties", {})
+    p = props.get(prop_name)
+    if not p:
+        return ""
+    if p.get("type") == "status":
+        s = p.get("status") or {}
+        return s.get("name", "")
+    return ""
+
+
+def parse_expires(expires_at_str: str) -> date | None:
+    if not expires_at_str:
+        return None
+    # ожидаем "YYYY-MM-DD"
+    try:
+        return datetime.strptime(expires_at_str.strip(), "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+async def get_active_subscription_for_user(tg_id: int) -> dict | None:
     """
-    Из всех записей пользователя берём:
-    - latest_approved_community: последняя approved для community (period_key 1m/3m)
-    - has_pending_any: есть ли pending (любая)
+    Возвращает последнюю APPROVED запись пользователя, которая еще НЕ истекла.
+    Если нет — None.
     """
-    latest_approved_community = None
-    has_pending_any = False
+    tg_id_str = str(tg_id)
 
-    for page in records:
-        props = page.get("properties", {})
-        status = safe_get_status(props, "status").lower()
-        period_key = safe_get_rich_text(props, "period_key").lower()
-
-        if status == "pending":
-            has_pending_any = True
-
-        # mentoring не показываем
-        if period_key == "mentoring":
-            continue
-
-        # community — это 1m/3m
-        if status == "approved" and period_key in ("1m", "3m"):
-            latest_approved_community = page
-            break  # уже отсортировано по created_time desc
-
-    return {
-        "latest_approved_community": latest_approved_community,
-        "has_pending_any": has_pending_any,
+    # tg_id = Text (rich_text), status = Status
+    filter_obj = {
+        "and": [
+            {"property": "tg_id", "rich_text": {"equals": tg_id_str}},
+            {"property": "status", "status": {"equals": "approved"}},
+        ]
     }
 
-async def render_cabinet_text(tg_id: str) -> str:
-    records = await notion_query_by_tg_id(tg_id=tg_id, limit=30)
-    picked = pick_latest_records(records)
+    data = await notion_query_database(filter_obj, page_size=50)
+    results = data.get("results", [])
 
-    approved = picked["latest_approved_community"]
-    has_pending = picked["has_pending_any"]
+    # Выберем самую свежую активную (по expires_at, либо по created_time)
+    today = datetime.utcnow().date()
 
-    if approved:
-        props = approved.get("properties", {})
-        discord = safe_get_rich_text(props, "discord") or "Не указан"
-        email = safe_get_rich_text(props, "email") or "Не указан"
-        expires_at = safe_get_rich_text(props, "expires_at").strip()
+    best_page = None
+    best_created = None
 
-        if expires_at and is_future_or_today(expires_at):
-            plan_line = f"Hadiukov Community — {format_date_ddmmyyyy(expires_at)}"
-        elif expires_at:
-            plan_line = f"Hadiukov Community — истекла {format_date_ddmmyyyy(expires_at)}"
+    for page in results:
+        expires_at = notion_get_text_prop(page, "expires_at")
+        exp_date = parse_expires(expires_at)
+        if not exp_date:
+            continue
+        if exp_date < today:
+            continue
+
+        created_time_str = page.get("created_time")  # ISO
+        created_dt = None
+        try:
+            created_dt = datetime.fromisoformat(created_time_str.replace("Z", "+00:00"))
+        except Exception:
+            created_dt = None
+
+        if best_page is None:
+            best_page = page
+            best_created = created_dt
         else:
-            plan_line = "Hadiukov Community — активная дата не указана"
+            # если есть created_time — сравниваем
+            if created_dt and best_created:
+                if created_dt > best_created:
+                    best_page = page
+                    best_created = created_dt
+            elif created_dt and not best_created:
+                best_page = page
+                best_created = created_dt
 
-        return (
-            "👤 <b>Личный кабинет</b>\n\n"
-            f"Discord: <b>{discord}</b>\n"
-            f"Email: <b>{email}</b>\n\n"
-            f"{plan_line}"
-        )
+    return best_page
 
-    # нет approved
-    base = (
-        "👤 <b>Личный кабинет</b>\n\n"
-        "Discord: <b>Не указан</b>\n"
-        "Email: <b>Не указан</b>\n\n"
-    )
-    if has_pending:
-        return base + "Статус: <b>На проверке админом</b>"
-    return base + "Статус: <b>Нет активной подписки</b>"
 
 # =========================
-# PAYMENT FLOW (final messages)
+# HELPERS
 # =========================
+
+def expires_from_key(key: str) -> str:
+    months = int(PERIOD_MONTHS[key])
+    return (datetime.utcnow() + relativedelta(months=months)).strftime("%Y-%m-%d")
+
+
+def build_tally_url(params: dict) -> str:
+    """
+    Важно: используем quote (а не quote_plus), чтобы mini app не ловил странные ссылки.
+    """
+    params = dict(params)
+    params["_tail"] = "1"  # чтобы tgWebAppData не прилипал к последнему параметру
+    query = urlencode(params, quote_via=quote)
+    return f"{TALLY_FORM_URL}?{query}"
+
+
+async def send_photo_safe(message: Message, path: str, caption: str | None = None, reply_markup=None):
+    try:
+        photo = FSInputFile(path)
+        await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
+    except Exception:
+        await message.answer(caption or " ", reply_markup=reply_markup)
+
+
+def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
+    # ВАЖНО: именно web_app — это mini app
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
+    ])
+
 
 async def send_payment_flow_final(
     message: Message,
     *,
-    tg_id: int,
-    tg_username: str | None,
     product: str,
     pay_method: str,
     currency: str,
@@ -253,37 +227,44 @@ async def send_payment_flow_final(
     expires_at: str = "",
 ):
     """
-    Финальные сообщения после выбора суммы:
-    - Crypto: "Для оплаты ... N USDT" + "адрес (в monospace только адрес) + кнопка tally"
-    - Fiat: "Для оплаты ... X грн" + "Скоро добавим карту." + кнопка tally
+    Генерим ссылку на Tally и открываем мини-приложением.
+    Hidden-поля в Tally (короткие):
+      t  -> tg_id
+      u  -> tg_username
+      pk -> period_key
+      as -> amount_usdt
+      au -> amount_uah
+      pm -> pay_method
+      o  -> order_id
+      ex -> expires_at
+      product, period (можешь оставить, если есть hidden)
     """
     order_id = str(uuid.uuid4())
 
     params = {
-        "order_id": order_id,
-        "tg_id": str(tg_id),
-        "tg_username": tg_username or "",
+        "t": str(message.from_user.id),
+        "u": message.from_user.username or "",
         "product": product,
         "period": period_text,
-        "period_key": period_key,
-        "pay_method": pay_method,
-        "expires_at": expires_at,
+        "pk": period_key,
+        "pm": pay_method,
+        "o": order_id,
+        "ex": expires_at,
     }
 
-    # поля для совместимости с твоими hidden-полями в Tally
+    # суммы (только одна заполняется)
     if currency == "USDT":
-        params["amount_usdt"] = str(amount)
-        params["amount_uah"] = ""
+        params["as"] = str(amount)
+        params["au"] = ""
     else:
-        params["amount_uah"] = str(amount)
-        params["amount_usdt"] = ""
+        params["as"] = ""
+        params["au"] = str(amount)
 
     tally_url = build_tally_url(params)
     kb = tally_confirm_kb(tally_url)
 
     if currency == "USDT":
         await message.answer(f"Для оплаты Вам необходимо перевести {amount} USDT:")
-        # monospace только адрес, остальное обычным
         await message.answer(
             f"<code>{USDT_TRC20_ADDRESS}</code> (USDT. Сеть TRC20)",
             reply_markup=kb,
@@ -291,6 +272,7 @@ async def send_payment_flow_final(
     else:
         await message.answer(f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
         await message.answer("Скоро добавим карту.", reply_markup=kb)
+
 
 # =========================
 # KEYBOARDS
@@ -315,12 +297,14 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
         is_persistent=True,
     )
 
+
 def resources_back_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="В главное меню")]],
         resize_keyboard=True,
         is_persistent=True,
     )
+
 
 def products_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -333,6 +317,7 @@ def products_menu_kb() -> ReplyKeyboardMarkup:
         is_persistent=True,
     )
 
+
 def resources_links_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="YouTube", url=YOUTUBE_URL)],
@@ -342,15 +327,18 @@ def resources_links_kb() -> InlineKeyboardMarkup:
         ],
     ])
 
+
 def kb_community_buy() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Купить подписку", callback_data="buy:community")]
     ])
 
+
 def kb_mentoring_buy() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Приобрести", callback_data="buy:mentoring")]
     ])
+
 
 def kb_payment_methods(product_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -360,12 +348,14 @@ def kb_payment_methods(product_key: str) -> InlineKeyboardMarkup:
         ]
     ])
 
+
 def kb_community_crypto_periods() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="1 месяц – 50 USDT", callback_data="sub:community:crypto:1m")],
         [InlineKeyboardButton(text="3 месяца – 120 USDT", callback_data="sub:community:crypto:3m")],
         [InlineKeyboardButton(text="Закрыть", callback_data="close")],
     ])
+
 
 def kb_community_fiat_periods() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -374,11 +364,13 @@ def kb_community_fiat_periods() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Закрыть", callback_data="close")],
     ])
 
+
 def kb_mentoring_crypto() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="3000 USDT", callback_data="sub:mentoring:crypto:once")],
         [InlineKeyboardButton(text="Закрыть", callback_data="close")],
     ])
+
 
 def kb_mentoring_fiat() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -386,10 +378,6 @@ def kb_mentoring_fiat() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Закрыть", callback_data="close")],
     ])
 
-def kb_close() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Закрыть", callback_data="close")]
-    ])
 
 # =========================
 # TEXTS
@@ -411,30 +399,28 @@ WELCOME_TEXT = (
 async def start(message: Message):
     await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
 
+
 @dp.message(Command("menu"))
 async def menu(message: Message):
     await message.answer("Главное меню 👇", reply_markup=main_menu_kb())
+
 
 @dp.message(lambda m: (m.text or "") == "В главное меню")
 async def back_to_main_menu(message: Message):
     await message.answer("Главное меню", reply_markup=main_menu_kb())
 
+
+# --- Main menu sections ---
+
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
     await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
+
 
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
     await message.answer("❓ Раздел «Помощь» пока в разработке.")
 
-@dp.message(lambda m: "Личный кабинет" in (m.text or ""))
-async def cabinet_from_menu(message: Message):
-    # Важно: НЕ меняем reply_markup, чтобы нижние плитки не исчезали
-    try:
-        text = await render_cabinet_text(str(message.from_user.id))
-        await message.answer(text)
-    except Exception as e:
-        await message.answer(f"Ошибка кабинета: {e}")
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
 async def resources_from_menu(message: Message):
@@ -449,19 +435,60 @@ async def resources_from_menu(message: Message):
         reply_markup=resources_back_kb(),
     )
 
+
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
 async def products_entry(message: Message):
     await send_photo_safe(message, PRODUCTS_IMAGE_PATH, caption=None)
     await message.answer("Выберите:", reply_markup=products_menu_kb())
 
+
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
     await message.answer("Объяснение внутрянки сервера", reply_markup=kb_community_buy())
+
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
     await message.answer("Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
+
+# --- Личный кабинет (READ ONLY из Notion) ---
+@dp.message(lambda m: "Личный кабинет" in (m.text or ""))
+async def cabinet_from_menu(message: Message):
+    try:
+        page = await get_active_subscription_for_user(message.from_user.id)
+
+        if not page:
+            # НЕТ активной подписки => ничего не показываем
+            await message.answer(
+                "👤 Личный кабинет\n\n"
+                "Discord: <b>Не указан</b>\n"
+                "Email: <b>Не указан</b>\n\n"
+                "Статус: <b>Нет активной подписки</b>"
+            )
+            return
+
+        discord = notion_get_text_prop(page, "discord")
+        email = notion_get_text_prop(page, "email")
+        expires_at = notion_get_text_prop(page, "expires_at")
+
+        # если в активной записи почему-то пусто — подстрахуемся
+        if not discord:
+            discord = "Не указан"
+        if not email:
+            email = "Не указан"
+
+        await message.answer(
+            "👤 Личный кабинет\n\n"
+            f"Discord: <b>{discord}</b>\n"
+            f"Email: <b>{email}</b>\n\n"
+            f"Подписка: <b>Hadiukov Community – {expires_at}</b>"
+        )
+    except Exception as e:
+        await message.answer(f"Ошибка кабинета: {e}")
+
+
+# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     await cb.message.delete()
@@ -472,6 +499,7 @@ async def buy_community(cb: CallbackQuery):
         reply_markup=kb_payment_methods("community"),
     )
     await cb.answer()
+
 
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
@@ -484,6 +512,8 @@ async def buy_mentoring(cb: CallbackQuery):
     )
     await cb.answer()
 
+
+# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
@@ -519,37 +549,29 @@ async def payment_method_choice(cb: CallbackQuery):
 
     await cb.answer()
 
+
 @dp.callback_query(F.data == "close")
 async def close_message(cb: CallbackQuery):
     await cb.message.delete()
     await cb.answer()
 
+
+# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
-    # ✅ ВАЖНО: пользователь = cb.from_user (НЕ cb.message.from_user)
-    tg_id = cb.from_user.id
-    tg_username = cb.from_user.username
-
     if product_key == "community":
         product_name = "Hadiukov Community"
 
-        if choice in ("1m", "3m"):
-            period_key = choice
-            period_text = PERIOD_TEXT[period_key]
-            expires_at = expires_from_key(period_key)
-        else:
-            period_key = ""
-            period_text = ""
-            expires_at = ""
+        period_key = choice if choice in ("1m", "3m") else ""
+        period_text = PERIOD_TEXT.get(period_key, "")
+        expires_at = expires_from_key(period_key) if period_key else ""
 
         if method == "crypto":
             amount = COMMUNITY_USDT_1M if choice == "1m" else COMMUNITY_USDT_3M
             await send_payment_flow_final(
                 cb.message,
-                tg_id=tg_id,
-                tg_username=tg_username,
                 product=product_name,
                 pay_method="Crypto (USDT)",
                 currency="USDT",
@@ -562,8 +584,6 @@ async def subscription_selected(cb: CallbackQuery):
             amount = COMMUNITY_UAH_1M if choice == "1m" else COMMUNITY_UAH_3M
             await send_payment_flow_final(
                 cb.message,
-                tg_id=tg_id,
-                tg_username=tg_username,
                 product=product_name,
                 pay_method="Fiat (UAH)",
                 currency="UAH",
@@ -574,14 +594,11 @@ async def subscription_selected(cb: CallbackQuery):
             )
 
     elif product_key == "mentoring":
+        # mentoring в кабинете не показываем, но покупку оставили
         product_name = "Hadiukov Mentoring"
-
-        # mentoring в кабинет не выводим, но оплату оставить можно
         if method == "crypto":
             await send_payment_flow_final(
                 cb.message,
-                tg_id=tg_id,
-                tg_username=tg_username,
                 product=product_name,
                 pay_method="Crypto (USDT)",
                 currency="USDT",
@@ -593,8 +610,6 @@ async def subscription_selected(cb: CallbackQuery):
         else:
             await send_payment_flow_final(
                 cb.message,
-                tg_id=tg_id,
-                tg_username=tg_username,
                 product=product_name,
                 pay_method="Fiat (UAH)",
                 currency="UAH",
@@ -605,6 +620,7 @@ async def subscription_selected(cb: CallbackQuery):
             )
 
     await cb.answer()
+
 
 # =========================
 # RUN
