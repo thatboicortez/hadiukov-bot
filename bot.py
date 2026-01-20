@@ -36,8 +36,8 @@ TELEGRAM_URL = "https://t.me/hadiukov"
 RESOURCES_IMAGE_PATH = "pictures/resources.PNG"
 # Картинка для "Мои продукты" (если нет — просто не покажет фото, не упадет)
 PRODUCTS_IMAGE_PATH = "pictures/products.PNG"
-PAYMENT_IMAGE_PATH = "pictures/payment.png"
-SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
+PAYMENT_IMAGE_PATH = "pictures/payment.PNG"
+SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.PNG"
 
 # Wallet
 USDT_TRC20_ADDRESS = "TAzH2VDmTZnmAjgwDUUVDDFGntpWk7a5kQ"
