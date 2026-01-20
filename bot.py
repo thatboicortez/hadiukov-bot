@@ -28,21 +28,17 @@ from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
 ADMIN_USERNAME = "@name"  # поменяешь потом
 
-# Resources links
 YOUTUBE_URL = "https://youtube.com/@hadiukov?si=vy9gXXiLKeDYIfR_"
 INSTAGRAM_URL = "https://www.instagram.com/hadiukov?igsh=MTdtZmp4MmtxdzF2dw=="
 TELEGRAM_URL = "https://t.me/hadiukov"
 
-# Images (пути в репо)
 RESOURCES_IMAGE_PATH = "pictures/resources.png"
 PRODUCTS_IMAGE_PATH = "pictures/products.png"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
 SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
 
-# Wallet
 USDT_TRC20_ADDRESS = "TAzH2VDmTZnmAjgwDUUVDDFGntpWk7a5kQ"
 
-# Prices
 COMMUNITY_USDT_1M = 50
 COMMUNITY_USDT_3M = 120
 COMMUNITY_UAH_1M = 2200
@@ -75,15 +71,11 @@ def expires_from_key(key: str) -> str:
 
 def build_tally_url(params: dict) -> str:
     params = dict(params)
-    params["_tail"] = "1"  # чтобы tgWebAppData не прилипал к последнему параметру
+    params["_tail"] = "1"
     query = urlencode(params, quote_via=quote_plus)
     return f"{TALLY_FORM_URL}?{query}"
 
 async def send_photo_safe(message: Message, path: str, caption: str | None = None, reply_markup=None):
-    """
-    Пытаемся отправить локальную картинку.
-    Если файла нет/ошибка — отправим просто текст, чтобы бот не падал.
-    """
     try:
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
@@ -105,7 +97,6 @@ def _format_ddmmyyyy(yyyy_mm_dd: str) -> str:
         dt = datetime.strptime(yyyy_mm_dd, "%Y-%m-%d").date()
         return dt.strftime("%d.%m.%Y")
     except Exception:
-        # если в Notion хранится как текст не в формате — просто покажем как есть
         return yyyy_mm_dd or "Не указано"
 
 def _is_active(expires_at: str) -> bool:
@@ -115,16 +106,11 @@ def _is_active(expires_at: str) -> bool:
     except Exception:
         return False
 
-# -------------------------
-# NOTION: read approved record
-# -------------------------
+# =========================
+# NOTION (READ ONLY)
+# =========================
 
 async def notion_query_latest_approved_by_tg_id(tg_id: str) -> Optional[dict]:
-    """
-    Ищем последнюю (по created_at desc) запись, где:
-    - tg_id == tg_id
-    - status == approved
-    """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -154,9 +140,6 @@ async def notion_query_latest_approved_by_tg_id(tg_id: str) -> Optional[dict]:
             return results[0] if results else None
 
 def _notion_get_plain_text(prop: dict) -> str:
-    """
-    Берём текст из title/rich_text. Если пусто — "".
-    """
     if not prop:
         return ""
     if prop.get("type") == "title":
@@ -170,14 +153,9 @@ def _notion_get_plain_text(prop: dict) -> str:
     if prop.get("type") == "status":
         st = prop.get("status") or {}
         return (st.get("name") or "").strip()
-    if prop.get("type") == "created_time":
-        return (prop.get("created_time") or "").strip()
     return ""
 
 def _extract_user_profile_from_page(page: dict) -> Tuple[str, str, str]:
-    """
-    Возвращает (discord, email, expires_at)
-    """
     props = (page or {}).get("properties", {}) or {}
     discord = _notion_get_plain_text(props.get("discord", {}))
     email = _notion_get_plain_text(props.get("email", {}))
@@ -185,9 +163,6 @@ def _extract_user_profile_from_page(page: dict) -> Tuple[str, str, str]:
     return discord, email, expires_at
 
 async def build_cabinet_text(user_id: int) -> str:
-    """
-    Формируем текст кабинета строго по approved записям.
-    """
     page = await notion_query_latest_approved_by_tg_id(str(user_id))
     if not page:
         return (
@@ -198,18 +173,13 @@ async def build_cabinet_text(user_id: int) -> str:
         )
 
     discord, email, expires_at = _extract_user_profile_from_page(page)
-
     discord_out = discord if discord else "Не указан"
     email_out = email if email else "Не указан"
 
     if expires_at and _is_active(expires_at):
         sub_line = f"Hadiukov Community — до <b>{_format_ddmmyyyy(expires_at)}</b>"
     else:
-        # если expires_at есть, но уже истёк — считаем нет активной
-        if expires_at:
-            sub_line = f"Hadiukov Community — <b>нет активной подписки</b> (было до {_format_ddmmyyyy(expires_at)})"
-        else:
-            sub_line = "Hadiukov Community — <b>нет активной подписки</b>"
+        sub_line = "Hadiukov Community — <b>нет активной подписки</b>"
 
     return (
         "👤 <b>Личный кабинет</b>\n\n"
@@ -235,18 +205,9 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
-    """
-    Финальные сообщения после выбора суммы:
-    - Crypto: "Для оплаты ... N USDT" + "адрес (в monospace только адрес) + кнопка tally"
-    - Fiat: "Для оплаты ... X грн" + "Скоро добавим карту." + кнопка tally
-    """
     order_id = str(uuid.uuid4())
-
-    # tg_username может быть пустым — ок
     tg_username = (user_username or "").lstrip("@")
 
-    # IMPORTANT: Tally должен иметь hidden поля с такими именами,
-    # чтобы они могли прилететь в Notion через интеграцию
     params = {
         "order_id": order_id,
         "tg_id": str(user_id),
@@ -256,7 +217,6 @@ async def send_payment_flow_final(
         "period_key": period_key,
         "pay_method": pay_method,
         "expires_at": expires_at,
-        # Эти два поля ты реально используешь в Tally как hidden
         "amount_usdt": str(amount) if currency == "USDT" else "",
         "amount_uah": str(amount) if currency == "UAH" else "",
     }
@@ -266,7 +226,6 @@ async def send_payment_flow_final(
 
     if currency == "USDT":
         await message.answer(f"Для оплаты Вам необходимо перевести {amount} USDT:")
-        # monospace только адрес, остальное обычным
         await message.answer(
             f"<code>{USDT_TRC20_ADDRESS}</code> (USDT. Сеть TRC20)",
             reply_markup=kb,
@@ -282,17 +241,9 @@ async def send_payment_flow_final(
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text="ℹ️ Информация"),
-                KeyboardButton(text="❓ Помощь"),
-            ],
-            [
-                KeyboardButton(text="📦 Мои продукты"),
-                KeyboardButton(text="🌐 Мои ресурсы"),
-            ],
-            [
-                KeyboardButton(text="👤 Личный кабинет"),
-            ],
+            [KeyboardButton(text="ℹ️ Информация"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="📦 Мои продукты"), KeyboardButton(text="🌐 Мои ресурсы")],
+            [KeyboardButton(text="👤 Личный кабинет")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -397,8 +348,6 @@ async def menu(message: Message):
 async def back_to_main_menu(message: Message):
     await message.answer("Главное меню", reply_markup=main_menu_kb())
 
-# --- Main menu sections ---
-
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
     await message.answer("ℹ️ Раздел «Информация» пока в разработке.", reply_markup=main_menu_kb())
@@ -409,24 +358,14 @@ async def help_from_menu(message: Message):
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
 async def resources_from_menu(message: Message):
-    await send_photo_safe(
-        message,
-        RESOURCES_IMAGE_PATH,
-        caption="Подписывайтесь ⬇️⬇️⬇️",
-        reply_markup=resources_links_kb(),
-    )
-    await message.answer(
-        "Чтобы вернуться, нажмите «В главное меню».",
-        reply_markup=resources_back_kb(),
-    )
+    await send_photo_safe(message, RESOURCES_IMAGE_PATH, caption="Подписывайтесь ⬇️⬇️⬇️", reply_markup=resources_links_kb())
+    await message.answer("Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
 
-# --- PRODUCTS ENTRY ---
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
 async def products_entry(message: Message):
     await send_photo_safe(message, PRODUCTS_IMAGE_PATH, caption=None)
     await message.answer("Выберите:", reply_markup=products_menu_kb())
 
-# --- Products menu choices ---
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
     await message.answer("Объяснение внутрянки сервера", reply_markup=kb_community_buy())
@@ -435,91 +374,51 @@ async def community_info(message: Message):
 async def mentoring_info(message: Message):
     await message.answer("Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
-# --- Inline: Buy / Acquire (удаляем сообщение с объяснением) ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     await cb.message.delete()
-    await send_photo_safe(
-        cb.message,
-        PAYMENT_IMAGE_PATH,
-        caption="Выберите способ оплаты",
-        reply_markup=kb_payment_methods("community"),
-    )
+    await send_photo_safe(cb.message, PAYMENT_IMAGE_PATH, caption="Выберите способ оплаты", reply_markup=kb_payment_methods("community"))
     await cb.answer()
 
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
     await cb.message.delete()
-    await send_photo_safe(
-        cb.message,
-        PAYMENT_IMAGE_PATH,
-        caption="Выберите способ оплаты",
-        reply_markup=kb_payment_methods("mentoring"),
-    )
+    await send_photo_safe(cb.message, PAYMENT_IMAGE_PATH, caption="Выберите способ оплаты", reply_markup=kb_payment_methods("mentoring"))
     await cb.answer()
 
-# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
 
     if product_key == "community" and method == "crypto":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_community_crypto_periods(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, caption="Выберите срок подписки", reply_markup=kb_community_crypto_periods())
     elif product_key == "community" and method == "fiat":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_community_fiat_periods(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, caption="Выберите срок подписки", reply_markup=kb_community_fiat_periods())
     elif product_key == "mentoring" and method == "crypto":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_mentoring_crypto(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, caption="Выберите срок подписки", reply_markup=kb_mentoring_crypto())
     elif product_key == "mentoring" and method == "fiat":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_mentoring_fiat(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, caption="Выберите срок подписки", reply_markup=kb_mentoring_fiat())
 
     await cb.answer()
 
-# --- Inline: Close current message ---
 @dp.callback_query(F.data == "close")
 async def close_message(cb: CallbackQuery):
     await cb.message.delete()
     await cb.answer()
 
-# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
-    # sub:{product}:{crypto|fiat}:{1m|3m|once}
     _, product_key, method, choice = cb.data.split(":")
 
     user_id = cb.from_user.id
-    user_username = cb.from_user.username  # важно: берём у пользователя, не у сообщения бота
+    user_username = cb.from_user.username  # важно: это username человека, а не бота
 
     if product_key == "community":
         product_name = "Hadiukov Community"
 
-        if choice in ("1m", "3m"):
-            period_key = choice
-            period_text = PERIOD_TEXT[period_key]
-            expires_at = expires_from_key(period_key)
-        else:
-            period_key = ""
-            period_text = ""
-            expires_at = ""
+        period_key = choice if choice in ("1m", "3m") else ""
+        period_text = PERIOD_TEXT.get(period_key, "")
+        expires_at = expires_from_key(period_key) if period_key else ""
 
         if method == "crypto":
             amount = COMMUNITY_USDT_1M if choice == "1m" else COMMUNITY_USDT_3M
@@ -552,7 +451,6 @@ async def subscription_selected(cb: CallbackQuery):
 
     elif product_key == "mentoring":
         product_name = "Hadiukov Mentoring"
-
         if method == "crypto":
             await send_payment_flow_final(
                 cb.message,
@@ -590,12 +488,9 @@ async def subscription_selected(cb: CallbackQuery):
 async def cabinet_from_menu(message: Message):
     try:
         text = await build_cabinet_text(message.from_user.id)
-        # ВАЖНО: не трогаем нижние плитки — оставляем main_menu_kb()
-        await message.answer(text, reply_markup=main_menu_kb(), reply_markup_inline=cabinet_refresh_kb())
-    except TypeError:
-        # aiogram не принимает reply_markup_inline; fallback:
-        text = await build_cabinet_text(message.from_user.id)
+        # 1) сообщение с кабинетом + нижние плитки (ReplyKeyboard)
         await message.answer(text, reply_markup=main_menu_kb())
+        # 2) отдельное сообщение с inline-кнопкой "Обновить"
         await message.answer(" ", reply_markup=cabinet_refresh_kb())
     except Exception as e:
         await message.answer(f"Ошибка кабинета: {e}", reply_markup=main_menu_kb())
@@ -604,7 +499,6 @@ async def cabinet_from_menu(message: Message):
 async def cabinet_refresh(cb: CallbackQuery):
     try:
         text = await build_cabinet_text(cb.from_user.id)
-        # отвечаем новым сообщением, чтобы не ломать UX
         await cb.message.answer(text, reply_markup=cabinet_refresh_kb())
         await cb.answer("Обновлено")
     except Exception as e:
