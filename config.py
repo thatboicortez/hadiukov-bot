@@ -1,27 +1,24 @@
 import os
+from dotenv import load_dotenv
 
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
+load_dotenv()
 
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-def _get_env(name: str, default: str = "") -> str:
-    return (os.getenv(name, default) or "").strip()
+# Можно задать в Koyeb как env TALLY_FORM_URL,
+# но если не задашь — возьмём хардкод отсюда.
+TALLY_FORM_URL = os.getenv("TALLY_FORM_URL", "").strip() or "https://tally.so/r/ja0451"
 
+NOTION_TOKEN = os.getenv("NOTION_TOKEN", "").strip()
+NOTION_DATABASE_ID = os.getenv("NOTION_DATABASE_ID", "").strip()
 
-BOT_TOKEN = _get_env("BOT_TOKEN")
-TALLY_FORM_URL = _get_env("TALLY_FORM_URL")
-
-# Notion (бот только читает)
-NOTION_TOKEN = _get_env("NOTION_TOKEN")
-NOTION_DATABASE_ID = _get_env("NOTION_DATABASE_ID")
+# (не обязательно) админ для текста приветствия
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "@name").strip()
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is empty. Set env BOT_TOKEN.")
 if not TALLY_FORM_URL:
-    raise RuntimeError("TALLY_FORM_URL is empty. Set env TALLY_FORM_URL.")
+    raise RuntimeError("TALLY_FORM_URL is empty. Set env TALLY_FORM_URL or hardcode it in config.py.")
 if not NOTION_TOKEN:
     raise RuntimeError("NOTION_TOKEN is empty. Set env NOTION_TOKEN.")
 if not NOTION_DATABASE_ID:
