@@ -40,7 +40,7 @@ PAYMENT_IMAGE_PATH = "pictures/payment.png"
 SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
 
 # Wallet
-USDT_TRC20_ADDRESS = "TAzH2VDmTZnmAjgwDUUVDDFGntpWk7a5kQ"
+USDT_TRC20_ADDRESS = "TX5VC5qAprsWcnCSSdgZGXtQMFD2JjVLyK"
 
 # Prices
 COMMUNITY_USDT_1M = 50
