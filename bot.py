@@ -445,13 +445,10 @@ async def cabinet_from_menu(message: Message):
         )
         await safe_answer(message, text)
 
-    except httpx.TimeoutException:
-        await safe_answer(message, "Ошибка кабинета: Notion не ответил вовремя (timeout). Попробуй ещё раз через 10–20 сек.")
-    except TelegramNetworkError:
-        # если даже Telegram не отвечает — просто молча не валим процесс
-        return
-    except Exception as e:
-        await safe_answer(message, f"Ошибка кабинета: {e}")
+except (httpx.TimeoutException, TelegramNetworkError):
+    await safe_answer(message, "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз.")
+except Exception as e:
+    await safe_answer(message, f"Ошибка кабинета: {e}")
 
 
 @dp.callback_query(F.data == "buy:community")
