@@ -47,7 +47,7 @@ COMMUNITY_USDT_3M = 120
 COMMUNITY_UAH_1M = 2200
 COMMUNITY_UAH_3M = 5200
 
-# Mentoring (не показываем в кабинете, но оставим покупку если нужно)
+# Mentoring
 MENTORING_USDT = 3000
 MENTORING_UAH = 130000
 
@@ -69,17 +69,23 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 
-async def notion_query_database(filter_obj: dict, page_size: int = 20) -> dict:
+async def notion_query_database(
+    filter_obj: dict | None = None,
+    page_size: int = 50,
+    sorts: list | None = None,
+) -> dict:
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-    payload = {
-        "filter": filter_obj,
-        "page_size": page_size,
-    }
+
+    payload: dict = {"page_size": page_size}
+    if filter_obj:
+        payload["filter"] = filter_obj
+    if sorts:
+        payload["sorts"] = sorts
 
     async with httpx.AsyncClient(timeout=20) as client:
         r = await client.post(url, headers=headers, json=payload)
@@ -88,7 +94,7 @@ async def notion_query_database(filter_obj: dict, page_size: int = 20) -> dict:
 
 
 def notion_get_text_prop(page: dict, prop_name: str) -> str:
-    """Поддерживает Text (rich_text) и Title."""
+    """Поддерживает Text (rich_text), Title и Email."""
     props = page.get("properties", {})
     p = props.get(prop_name)
     if not p:
@@ -112,7 +118,7 @@ def notion_get_status(page: dict, prop_name: str) -> str:
         return ""
     if p.get("type") == "status":
         s = p.get("status") or {}
-        return s.get("name", "")
+        return s.get("name", "") or ""
     return ""
 
 
@@ -126,31 +132,27 @@ def parse_expires(expires_at_str: str) -> date | None:
         return None
 
 
-async def get_active_subscription_for_user(tg_id: int) -> dict | None:
-    """
-    Возвращает последнюю APPROVED запись пользователя, которая еще НЕ истекла.
-    Если нет — None.
-    """
+def is_approved(status_name: str) -> bool:
+    return (status_name or "").strip().lower() == "approved"
+
+
+async def get_user_records(tg_id: int) -> list[dict]:
+    """Берём все записи пользователя и сортируем по created_time DESC (самые новые сверху)."""
     tg_id_str = str(tg_id)
+    filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
+    sorts = [{"timestamp": "created_time", "direction": "descending"}]
+    data = await notion_query_database(filter_obj, page_size=50, sorts=sorts)
+    return data.get("results", []) or []
 
-    # tg_id = Text (rich_text), status = Status
-    filter_obj = {
-        "and": [
-            {"property": "tg_id", "rich_text": {"equals": tg_id_str}},
-            {"property": "status", "status": {"equals": "approved"}},
-        ]
-    }
 
-    data = await notion_query_database(filter_obj, page_size=50)
-    results = data.get("results", [])
-
-    # Выберем самую свежую активную (по expires_at, либо по created_time)
+def pick_active_approved(records: list[dict]) -> dict | None:
+    """Первая подходящая (самая свежая) approved-запись, которая ещё не истекла."""
     today = datetime.utcnow().date()
+    for page in records:
+        status_name = notion_get_status(page, "status")
+        if not is_approved(status_name):
+            continue
 
-    best_page = None
-    best_created = None
-
-    for page in results:
         expires_at = notion_get_text_prop(page, "expires_at")
         exp_date = parse_expires(expires_at)
         if not exp_date:
@@ -158,27 +160,8 @@ async def get_active_subscription_for_user(tg_id: int) -> dict | None:
         if exp_date < today:
             continue
 
-        created_time_str = page.get("created_time")  # ISO
-        created_dt = None
-        try:
-            created_dt = datetime.fromisoformat(created_time_str.replace("Z", "+00:00"))
-        except Exception:
-            created_dt = None
-
-        if best_page is None:
-            best_page = page
-            best_created = created_dt
-        else:
-            # если есть created_time — сравниваем
-            if created_dt and best_created:
-                if created_dt > best_created:
-                    best_page = page
-                    best_created = created_dt
-            elif created_dt and not best_created:
-                best_page = page
-                best_created = created_dt
-
-    return best_page
+        return page
+    return None
 
 
 # =========================
@@ -227,7 +210,6 @@ async def send_payment_flow_final(
     expires_at: str = "",
 ):
     """
-    Генерим ссылку на Tally и открываем мини-приложением.
     Hidden-поля в Tally (короткие):
       t  -> tg_id
       u  -> tg_username
@@ -237,7 +219,7 @@ async def send_payment_flow_final(
       pm -> pay_method
       o  -> order_id
       ex -> expires_at
-      product, period (можешь оставить, если есть hidden)
+      product, period (если есть hidden в форме)
     """
     order_id = str(uuid.uuid4())
 
@@ -252,7 +234,6 @@ async def send_payment_flow_final(
         "ex": expires_at,
     }
 
-    # суммы (только одна заполняется)
     if currency == "USDT":
         params["as"] = str(amount)
         params["au"] = ""
@@ -456,10 +437,9 @@ async def mentoring_info(message: Message):
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
     try:
-        page = await get_active_subscription_for_user(message.from_user.id)
+        records = await get_user_records(message.from_user.id)
 
-        if not page:
-            # НЕТ активной подписки => ничего не показываем
+        if not records:
             await message.answer(
                 "👤 Личный кабинет\n\n"
                 "Discord: <b>Не указан</b>\n"
@@ -468,22 +448,42 @@ async def cabinet_from_menu(message: Message):
             )
             return
 
-        discord = notion_get_text_prop(page, "discord")
-        email = notion_get_text_prop(page, "email")
-        expires_at = notion_get_text_prop(page, "expires_at")
+        active = pick_active_approved(records)
 
-        # если в активной записи почему-то пусто — подстрахуемся
-        if not discord:
-            discord = "Не указан"
-        if not email:
-            email = "Не указан"
+        if active:
+            discord = notion_get_text_prop(active, "discord") or "Не указан"
+            email = notion_get_text_prop(active, "email") or "Не указан"
+            expires_at = notion_get_text_prop(active, "expires_at") or ""
+
+            await message.answer(
+                "👤 Личный кабинет\n\n"
+                f"Discord: <b>{discord}</b>\n"
+                f"Email: <b>{email}</b>\n\n"
+                f"Подписка: <b>Hadiukov Community – {expires_at}</b>"
+            )
+            return
+
+        # Если нет активной approved, но есть запись — значит заявка есть, но на проверке/отклонена/и т.д.
+        latest = records[0]
+        discord = notion_get_text_prop(latest, "discord") or "Не указан"
+        email = notion_get_text_prop(latest, "email") or "Не указан"
+        status_name = notion_get_status(latest, "status").strip()
+
+        # Приводим к понятному тексту
+        if is_approved(status_name):
+            status_text = "Подписка активируется (проверь expires_at)"
+        elif status_name:
+            status_text = "Заявка на проверке" if status_name.lower() != "rejected" else "Заявка отклонена"
+        else:
+            status_text = "Заявка на проверке"
 
         await message.answer(
             "👤 Личный кабинет\n\n"
             f"Discord: <b>{discord}</b>\n"
             f"Email: <b>{email}</b>\n\n"
-            f"Подписка: <b>Hadiukov Community – {expires_at}</b>"
+            f"Статус: <b>{status_text}</b>"
         )
+
     except Exception as e:
         await message.answer(f"Ошибка кабинета: {e}")
 
@@ -594,7 +594,6 @@ async def subscription_selected(cb: CallbackQuery):
             )
 
     elif product_key == "mentoring":
-        # mentoring в кабинете не показываем, но покупку оставили
         product_name = "Hadiukov Mentoring"
         if method == "crypto":
             await send_payment_flow_final(
