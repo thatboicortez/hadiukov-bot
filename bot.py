@@ -4,6 +4,7 @@ from datetime import datetime, date
 from urllib.parse import urlencode, quote
 
 import httpx
+from aiohttp import ClientTimeout
 from dateutil.relativedelta import relativedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -18,6 +19,8 @@ from aiogram.types import (
     KeyboardButton,
     FSInputFile,
 )
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
 from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
@@ -54,11 +57,63 @@ PERIOD_TEXT = {"1m": "1 month", "3m": "3 months"}
 PERIOD_MONTHS = {"1m": 1, "3m": 3}
 
 # =========================
-# BOT INIT
+# BOT INIT (Telegram timeout)
 # =========================
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+# Увеличенный таймаут запросов к Telegram (важно для слабых инстансов eNano)
+tg_session = AiohttpSession(timeout=ClientTimeout(total=45))
+bot = Bot(BOT_TOKEN, parse_mode="HTML", session=tg_session)
 dp = Dispatcher()
+
+# =========================
+# SAFE SEND HELPERS (Telegram retries)
+# =========================
+
+async def safe_delete_message(message: Message):
+    try:
+        await message.delete()
+    except Exception:
+        return
+
+
+async def safe_answer(message: Message, text: str, **kwargs):
+    """
+    Надежная отправка текста: 3 попытки, мягкий backoff.
+    Не спамит ошибками пользователю, если Telegram временно "подвис".
+    """
+    for i in range(3):
+        try:
+            return await message.answer(text, **kwargs)
+        except TelegramRetryAfter as e:
+            # если Telegram попросил подождать
+            await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.2)
+        except TelegramNetworkError:
+            if i == 2:
+                return
+            await asyncio.sleep(0.8 * (i + 1))
+        except Exception:
+            # любые прочие редкие ошибки — не падаем
+            return
+
+
+async def safe_answer_photo(message: Message, path: str, caption: str | None = None, reply_markup=None):
+    """
+    Надежная отправка фото: если фото не ушло — падаем на текст.
+    """
+    for i in range(2):
+        try:
+            photo = FSInputFile(path)
+            return await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.2)
+        except TelegramNetworkError:
+            await asyncio.sleep(0.8 * (i + 1))
+        except Exception:
+            break
+
+    # fallback
+    return await safe_answer(message, caption or " ", reply_markup=reply_markup)
+
 
 # =========================
 # NOTION (READ ONLY)
@@ -67,10 +122,16 @@ dp = Dispatcher()
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
+# Один httpx-клиент на весь процесс (быстрее/стабильнее, меньше CPU/соединений)
+notion_client = httpx.AsyncClient(
+    timeout=httpx.Timeout(45.0),
+    limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
+)
+
 
 async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
     """
-    Query Notion DB. Сделал таймаут больше, чтобы не ловить random timeout на слабом инстансе.
+    Query Notion DB с ретраями на network/timeout.
     """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
@@ -84,16 +145,24 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
         "sorts": [{"timestamp": "created_time", "direction": "descending"}],
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
+    last_err = None
+    for i in range(3):
+        try:
+            r = await notion_client.post(url, headers=headers, json=payload)
+            r.raise_for_status()
+            return r.json()
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            last_err = e
+            await asyncio.sleep(0.8 * (i + 1))
+        except httpx.HTTPStatusError as e:
+            # Если Notion вернул 4xx/5xx — ретраить обычно бессмысленно
+            raise e
+    # после ретраев
+    raise last_err if last_err else RuntimeError("Notion query failed")
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
-    """
-    Читает Notion Text (rich_text) как строку.
-    """
+    """Читает Notion Text (rich_text) как строку."""
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -103,18 +172,6 @@ def _rt_plain(props: dict, prop_name: str) -> str:
     if not arr:
         return ""
     return arr[0].get("plain_text", "") or ""
-
-
-def _email_plain(props: dict, prop_name: str) -> str:
-    p = (props or {}).get(prop_name)
-    if not p:
-        return ""
-    if p.get("type") == "email":
-        return p.get("email") or ""
-    # если у тебя email тоже Text — тогда он придет как rich_text:
-    if p.get("type") == "rich_text":
-        return _rt_plain(props, prop_name)
-    return ""
 
 
 def _title_plain(props: dict, prop_name: str = "Name") -> str:
@@ -132,7 +189,7 @@ def _title_plain(props: dict, prop_name: str = "Name") -> str:
 def _status_name(props: dict, prop_name: str = "status") -> str:
     """
     Читает Notion Status как name.
-    Если ты вдруг сделаешь status обычным Text — тоже отработает (через rich_text).
+    Если вдруг сделаешь status Text/Select — тоже отработает.
     """
     p = (props or {}).get(prop_name)
     if not p:
@@ -150,9 +207,7 @@ def _status_name(props: dict, prop_name: str = "status") -> str:
 
 
 def _parse_expires(expires_at_str: str) -> date | None:
-    """
-    Ожидаем текст 'YYYY-MM-DD' (у тебя expires_at = text).
-    """
+    """Ожидаем текст 'YYYY-MM-DD' (у тебя expires_at = text)."""
     if not expires_at_str:
         return None
     try:
@@ -162,9 +217,7 @@ def _parse_expires(expires_at_str: str) -> date | None:
 
 
 async def get_latest_request_for_user(tg_id: int) -> dict | None:
-    """
-    Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса).
-    """
+    """Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса)."""
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
     data = await notion_query_database(filter_obj, page_size=10)
@@ -173,7 +226,7 @@ async def get_latest_request_for_user(tg_id: int) -> dict | None:
 
 
 # =========================
-# HELPERS
+# PAYMENT / TALLY HELPERS
 # =========================
 
 def expires_from_key(key: str) -> str:
@@ -182,21 +235,11 @@ def expires_from_key(key: str) -> str:
 
 
 def build_tally_url(params: dict) -> str:
-    """
-    Важно: quote (а не quote_plus), и добавляем _tail чтобы tgWebAppData не прилипал.
-    """
+    """quote (а не quote_plus), и добавляем _tail чтобы tgWebAppData не прилипал."""
     params = dict(params)
     params["_tail"] = "1"
     query = urlencode(params, quote_via=quote)
     return f"{TALLY_FORM_URL}?{query}"
-
-
-async def send_photo_safe(message: Message, path: str, caption: str | None = None, reply_markup=None):
-    try:
-        photo = FSInputFile(path)
-        await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
-    except Exception:
-        await message.answer(caption or " ", reply_markup=reply_markup)
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
@@ -254,14 +297,15 @@ async def send_payment_flow_final(
     kb = tally_confirm_kb(tally_url)
 
     if currency == "USDT":
-        await message.answer(f"Для оплаты Вам необходимо перевести {amount} USDT:")
-        await message.answer(
+        await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} USDT:")
+        await safe_answer(
+            message,
             f"<code>{USDT_TRC20_ADDRESS}</code> (USDT. Сеть TRC20)",
             reply_markup=kb,
         )
     else:
-        await message.answer(f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
-        await message.answer("Скоро добавим карту.", reply_markup=kb)
+        await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
+        await safe_answer(message, "Скоро добавим карту.", reply_markup=kb)
 
 
 # =========================
@@ -379,60 +423,59 @@ WELCOME_TEXT = (
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    await safe_answer(message, WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
 @dp.message(Command("menu"))
 async def menu(message: Message):
-    await message.answer("Главное меню 👇", reply_markup=main_menu_kb())
+    await safe_answer(message, "Главное меню 👇", reply_markup=main_menu_kb())
 
 
 @dp.message(lambda m: (m.text or "") == "В главное меню")
 async def back_to_main_menu(message: Message):
-    await message.answer("Главное меню", reply_markup=main_menu_kb())
+    await safe_answer(message, "Главное меню", reply_markup=main_menu_kb())
 
 
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
-    await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
+    await safe_answer(message, "ℹ️ Раздел «Информация» пока в разработке.")
 
 
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
-    await message.answer("❓ Раздел «Помощь» пока в разработке.")
+    await safe_answer(message, "❓ Раздел «Помощь» пока в разработке.")
 
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
 async def resources_from_menu(message: Message):
-    await send_photo_safe(
+    await safe_answer_photo(
         message,
         RESOURCES_IMAGE_PATH,
         caption="Подписывайтесь ⬇️⬇️⬇️",
         reply_markup=resources_links_kb(),
     )
-    await message.answer("Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
+    await safe_answer(message, "Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
 
 
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
 async def products_entry(message: Message):
-    await send_photo_safe(message, PRODUCTS_IMAGE_PATH, caption=None)
-    await message.answer("Выберите:", reply_markup=products_menu_kb())
+    await safe_answer_photo(message, PRODUCTS_IMAGE_PATH, caption=None)
+    await safe_answer(message, "Выберите:", reply_markup=products_menu_kb())
 
 
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
-    await message.answer("Объяснение внутрянки сервера", reply_markup=kb_community_buy())
+    await safe_answer(message, "Объяснение внутрянки сервера", reply_markup=kb_community_buy())
 
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
-    await message.answer("Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
+    await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
 # --- Личный кабинет ---
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    # Значения по умолчанию
     discord = "Не указан"
     email = "Не указан"
     status_text = "Нет активной подписки"
@@ -471,7 +514,6 @@ async def cabinet_from_menu(message: Message):
                     status_text = "Активна (дата не указана)"
 
             else:
-                # статус пустой/непонятный — считаем что на проверке
                 status_text = "Заявка на проверке"
 
         text = (
@@ -480,19 +522,20 @@ async def cabinet_from_menu(message: Message):
             f"Email: <b>{email}</b>\n\n"
             f"Статус: <b>{status_text}</b>"
         )
-        await message.answer(text)
+        await safe_answer(message, text)
 
-    except httpx.TimeoutException:
-        await message.answer("Ошибка кабинета: Notion не ответил вовремя (timeout). Попробуй ещё раз через 10–20 сек.")
-    except Exception as e:
-        await message.answer(f"Ошибка кабинета: {e}")
+    except (httpx.TimeoutException, httpx.NetworkError):
+        await safe_answer(message, "Notion сейчас не ответил (timeout). Попробуй ещё раз через 10–20 сек.")
+    except Exception:
+        # не спамим страшными трейсами пользователю
+        await safe_answer(message, "Временная ошибка. Попробуй ещё раз через 10–20 сек.")
 
 
 # --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
-    await cb.message.delete()
-    await send_photo_safe(
+    await safe_delete_message(cb.message)
+    await safe_answer_photo(
         cb.message,
         PAYMENT_IMAGE_PATH,
         caption="Выберите способ оплаты",
@@ -503,8 +546,8 @@ async def buy_community(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
-    await cb.message.delete()
-    await send_photo_safe(
+    await safe_delete_message(cb.message)
+    await safe_answer_photo(
         cb.message,
         PAYMENT_IMAGE_PATH,
         caption="Выберите способ оплаты",
@@ -519,28 +562,28 @@ async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
 
     if product_key == "community" and method == "crypto":
-        await send_photo_safe(
+        await safe_answer_photo(
             cb.message,
             SUBSCRIPTION_IMAGE_PATH,
             caption="Выберите срок подписки",
             reply_markup=kb_community_crypto_periods(),
         )
     elif product_key == "community" and method == "fiat":
-        await send_photo_safe(
+        await safe_answer_photo(
             cb.message,
             SUBSCRIPTION_IMAGE_PATH,
             caption="Выберите срок подписки",
             reply_markup=kb_community_fiat_periods(),
         )
     elif product_key == "mentoring" and method == "crypto":
-        await send_photo_safe(
+        await safe_answer_photo(
             cb.message,
             SUBSCRIPTION_IMAGE_PATH,
             caption="Выберите срок подписки",
             reply_markup=kb_mentoring_crypto(),
         )
     elif product_key == "mentoring" and method == "fiat":
-        await send_photo_safe(
+        await safe_answer_photo(
             cb.message,
             SUBSCRIPTION_IMAGE_PATH,
             caption="Выберите срок подписки",
@@ -552,7 +595,7 @@ async def payment_method_choice(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "close")
 async def close_message(cb: CallbackQuery):
-    await cb.message.delete()
+    await safe_delete_message(cb.message)
     await cb.answer()
 
 
@@ -561,8 +604,7 @@ async def close_message(cb: CallbackQuery):
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
-    # ✅ ВАЖНО: тут используем cb.from_user (это реальный юзер),
-    # а НЕ cb.message.from_user (это бот).
+    # ✅ важно: реальный юзер
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
@@ -640,7 +682,18 @@ async def subscription_selected(cb: CallbackQuery):
 # =========================
 
 async def main():
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        # корректно закрываем клиенты
+        try:
+            await notion_client.aclose()
+        except Exception:
+            pass
+        try:
+            await bot.session.close()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     asyncio.run(main())
