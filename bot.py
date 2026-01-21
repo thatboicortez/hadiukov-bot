@@ -18,6 +18,7 @@ from aiogram.types import (
     KeyboardButton,
     FSInputFile,
 )
+from aiogram.exceptions import TelegramNetworkError
 
 from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
@@ -57,8 +58,25 @@ PERIOD_MONTHS = {"1m": 1, "3m": 3}
 # BOT INIT
 # =========================
 
+# ✅ ВАЖНО: без aiohttp.ClientTimeout, иначе Koyeb может падать как на твоём скрине
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
+
+# =========================
+# SAFE SEND (Telegram timeout retry)
+# =========================
+
+async def safe_answer(message: Message, text: str, *, reply_markup=None, retries: int = 2):
+    last_err = None
+    for _ in range(retries):
+        try:
+            return await message.answer(text, reply_markup=reply_markup)
+        except TelegramNetworkError as e:
+            last_err = e
+            await asyncio.sleep(1.0)
+    # если совсем плохо — покажем 1 раз, чтобы ты видел
+    raise last_err
+
 
 # =========================
 # NOTION (READ ONLY)
@@ -70,7 +88,7 @@ NOTION_VERSION = "2022-06-28"
 
 async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
     """
-    Query Notion DB. Сделал таймаут больше, чтобы не ловить random timeout на слабом инстансе.
+    Query Notion DB. Таймаут больше, чтобы не ловить random timeout на слабом инстансе.
     """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
@@ -91,9 +109,6 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
-    """
-    Читает Notion Text (rich_text) как строку.
-    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -105,34 +120,10 @@ def _rt_plain(props: dict, prop_name: str) -> str:
     return arr[0].get("plain_text", "") or ""
 
 
-def _email_plain(props: dict, prop_name: str) -> str:
-    p = (props or {}).get(prop_name)
-    if not p:
-        return ""
-    if p.get("type") == "email":
-        return p.get("email") or ""
-    # если у тебя email тоже Text — тогда он придет как rich_text:
-    if p.get("type") == "rich_text":
-        return _rt_plain(props, prop_name)
-    return ""
-
-
-def _title_plain(props: dict, prop_name: str = "Name") -> str:
-    p = (props or {}).get(prop_name)
-    if not p:
-        return ""
-    if p.get("type") != "title":
-        return ""
-    arr = p.get("title") or []
-    if not arr:
-        return ""
-    return arr[0].get("plain_text", "") or ""
-
-
 def _status_name(props: dict, prop_name: str = "status") -> str:
     """
     Читает Notion Status как name.
-    Если ты вдруг сделаешь status обычным Text — тоже отработает (через rich_text).
+    Если вдруг сделаешь status обычным Text — тоже отработает (через rich_text).
     """
     p = (props or {}).get(prop_name)
     if not p:
@@ -150,9 +141,6 @@ def _status_name(props: dict, prop_name: str = "status") -> str:
 
 
 def _parse_expires(expires_at_str: str) -> date | None:
-    """
-    Ожидаем текст 'YYYY-MM-DD' (у тебя expires_at = text).
-    """
     if not expires_at_str:
         return None
     try:
@@ -162,9 +150,6 @@ def _parse_expires(expires_at_str: str) -> date | None:
 
 
 async def get_latest_request_for_user(tg_id: int) -> dict | None:
-    """
-    Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса).
-    """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
     data = await notion_query_database(filter_obj, page_size=10)
@@ -177,14 +162,12 @@ async def get_latest_request_for_user(tg_id: int) -> dict | None:
 # =========================
 
 def expires_from_key(key: str) -> str:
+    # expires_at хранится как TEXT 'YYYY-MM-DD'
     months = int(PERIOD_MONTHS[key])
     return (datetime.utcnow() + relativedelta(months=months)).strftime("%Y-%m-%d")
 
 
 def build_tally_url(params: dict) -> str:
-    """
-    Важно: quote (а не quote_plus), и добавляем _tail чтобы tgWebAppData не прилипал.
-    """
     params = dict(params)
     params["_tail"] = "1"
     query = urlencode(params, quote_via=quote)
@@ -195,8 +178,11 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
     try:
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
+    except TelegramNetworkError:
+        # Telegram timeout — попробуем обычным текстом
+        await safe_answer(message, caption or " ", reply_markup=reply_markup)
     except Exception:
-        await message.answer(caption or " ", reply_markup=reply_markup)
+        await safe_answer(message, caption or " ", reply_markup=reply_markup)
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
@@ -218,18 +204,6 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
-    """
-    Hidden-поля в Tally (короткие):
-      t  -> tg_id
-      u  -> tg_username
-      pk -> period_key
-      as -> amount_usdt
-      au -> amount_uah
-      pm -> pay_method
-      o  -> order_id
-      ex -> expires_at
-      product, period
-    """
     order_id = str(uuid.uuid4())
 
     params = {
@@ -254,14 +228,11 @@ async def send_payment_flow_final(
     kb = tally_confirm_kb(tally_url)
 
     if currency == "USDT":
-        await message.answer(f"Для оплаты Вам необходимо перевести {amount} USDT:")
-        await message.answer(
-            f"<code>{USDT_TRC20_ADDRESS}</code> (USDT. Сеть TRC20)",
-            reply_markup=kb,
-        )
+        await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} USDT:")
+        await safe_answer(message, f"<code>{USDT_TRC20_ADDRESS}</code> (USDT. Сеть TRC20)", reply_markup=kb)
     else:
-        await message.answer(f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
-        await message.answer("Скоро добавим карту.", reply_markup=kb)
+        await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
+        await safe_answer(message, "Скоро добавим карту.", reply_markup=kb)
 
 
 # =========================
@@ -379,27 +350,27 @@ WELCOME_TEXT = (
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    await message.answer(WELCOME_TEXT, reply_markup=main_menu_kb())
+    await safe_answer(message, WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
 @dp.message(Command("menu"))
 async def menu(message: Message):
-    await message.answer("Главное меню 👇", reply_markup=main_menu_kb())
+    await safe_answer(message, "Главное меню 👇", reply_markup=main_menu_kb())
 
 
 @dp.message(lambda m: (m.text or "") == "В главное меню")
 async def back_to_main_menu(message: Message):
-    await message.answer("Главное меню", reply_markup=main_menu_kb())
+    await safe_answer(message, "Главное меню", reply_markup=main_menu_kb())
 
 
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
-    await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
+    await safe_answer(message, "ℹ️ Раздел «Информация» пока в разработке.")
 
 
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
-    await message.answer("❓ Раздел «Помощь» пока в разработке.")
+    await safe_answer(message, "❓ Раздел «Помощь» пока в разработке.")
 
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
@@ -410,29 +381,27 @@ async def resources_from_menu(message: Message):
         caption="Подписывайтесь ⬇️⬇️⬇️",
         reply_markup=resources_links_kb(),
     )
-    await message.answer("Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
+    await safe_answer(message, "Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
 
 
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
 async def products_entry(message: Message):
     await send_photo_safe(message, PRODUCTS_IMAGE_PATH, caption=None)
-    await message.answer("Выберите:", reply_markup=products_menu_kb())
+    await safe_answer(message, "Выберите:", reply_markup=products_menu_kb())
 
 
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
-    await message.answer("Объяснение внутрянки сервера", reply_markup=kb_community_buy())
+    await safe_answer(message, "Объяснение внутрянки сервера", reply_markup=kb_community_buy())
 
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
-    await message.answer("Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
+    await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
-# --- Личный кабинет ---
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    # Значения по умолчанию
     discord = "Не указан"
     email = "Не указан"
     status_text = "Нет активной подписки"
@@ -442,21 +411,17 @@ async def cabinet_from_menu(message: Message):
 
         if page:
             props = page.get("properties", {})
-
-            st = _status_name(props, "status")  # pending/approved/rejected
+            st = _status_name(props, "status")
             expires_raw = _rt_plain(props, "expires_at")
             expires_dt = _parse_expires(expires_raw)
 
             if st == "pending":
                 status_text = "Заявка на проверке"
-
             elif st == "rejected":
                 status_text = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
-
             elif st == "approved":
                 d = _rt_plain(props, "discord")
                 e = _rt_plain(props, "email")
-
                 if d:
                     discord = d
                 if e:
@@ -469,9 +434,7 @@ async def cabinet_from_menu(message: Message):
                         status_text = f"Подписка истекла: {expires_dt.isoformat()}"
                 else:
                     status_text = "Активна (дата не указана)"
-
             else:
-                # статус пустой/непонятный — считаем что на проверке
                 status_text = "Заявка на проверке"
 
         text = (
@@ -480,15 +443,17 @@ async def cabinet_from_menu(message: Message):
             f"Email: <b>{email}</b>\n\n"
             f"Статус: <b>{status_text}</b>"
         )
-        await message.answer(text)
+        await safe_answer(message, text)
 
     except httpx.TimeoutException:
-        await message.answer("Ошибка кабинета: Notion не ответил вовремя (timeout). Попробуй ещё раз через 10–20 сек.")
+        await safe_answer(message, "Ошибка кабинета: Notion не ответил вовремя (timeout). Попробуй ещё раз через 10–20 сек.")
+    except TelegramNetworkError:
+        # если даже Telegram не отвечает — просто молча не валим процесс
+        return
     except Exception as e:
-        await message.answer(f"Ошибка кабинета: {e}")
+        await safe_answer(message, f"Ошибка кабинета: {e}")
 
 
-# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     await cb.message.delete()
@@ -513,39 +478,18 @@ async def buy_mentoring(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
 
     if product_key == "community" and method == "crypto":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_community_crypto_periods(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_crypto_periods())
     elif product_key == "community" and method == "fiat":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_community_fiat_periods(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_fiat_periods())
     elif product_key == "mentoring" and method == "crypto":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_mentoring_crypto(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_crypto())
     elif product_key == "mentoring" and method == "fiat":
-        await send_photo_safe(
-            cb.message,
-            SUBSCRIPTION_IMAGE_PATH,
-            caption="Выберите срок подписки",
-            reply_markup=kb_mentoring_fiat(),
-        )
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_fiat())
 
     await cb.answer()
 
@@ -556,19 +500,15 @@ async def close_message(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
-    # ✅ ВАЖНО: тут используем cb.from_user (это реальный юзер),
-    # а НЕ cb.message.from_user (это бот).
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
     if product_key == "community":
         product_name = "Hadiukov Community"
-
         period_key = choice if choice in ("1m", "3m") else ""
         period_text = PERIOD_TEXT.get(period_key, "")
         expires_at = expires_from_key(period_key) if period_key else ""
@@ -634,10 +574,6 @@ async def subscription_selected(cb: CallbackQuery):
 
     await cb.answer()
 
-
-# =========================
-# RUN
-# =========================
 
 async def main():
     await dp.start_polling(bot)
