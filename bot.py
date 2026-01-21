@@ -89,120 +89,102 @@ async def notion_query_database(filter_obj: dict, page_size: int = 20, sorts: li
         return r.json()
 
 
-def notion_get_text_prop(page: dict, prop_name: str) -> str:
-    """Поддерживает Text (rich_text) и Title и Email."""
+def notion_get_prop_as_text(page: dict, prop_name: str) -> str:
+    """
+    Достаёт значение из Notion property как строку.
+    Поддержка: rich_text, title, email, date.
+    """
     props = page.get("properties", {})
     p = props.get(prop_name)
     if not p:
         return ""
+
     t = p.get("type")
+
     if t == "rich_text":
         arr = p.get("rich_text", [])
         return arr[0].get("plain_text", "") if arr else ""
+
     if t == "title":
         arr = p.get("title", [])
         return arr[0].get("plain_text", "") if arr else ""
+
     if t == "email":
         return p.get("email") or ""
+
+    if t == "date":
+        d = p.get("date") or {}
+        # start бывает "YYYY-MM-DD" или ISO с временем
+        return (d.get("start") or "").strip()
+
+    # если вдруг ещё что-то — безопасно вернём пусто
     return ""
 
 
-def notion_get_choice_name(page: dict, prop_name: str) -> str:
-    """
-    Возвращает name для properties типа:
-      - status
-      - select
-    """
-    props = page.get("properties", {})
-    p = props.get(prop_name)
-    if not p:
-        return ""
-
-    t = p.get("type")
-    if t == "status":
-        s = p.get("status") or {}
-        return s.get("name", "") or ""
-    if t == "select":
-        s = p.get("select") or {}
-        return s.get("name", "") or ""
-    return ""
-
-
-def parse_expires(expires_at_str: str) -> date | None:
-    if not expires_at_str:
+def parse_date_any(s: str) -> date | None:
+    if not s:
         return None
-    s = expires_at_str.strip()
+    s = s.strip()
 
     # 1) "YYYY-MM-DD"
     try:
-        return datetime.strptime(s, "%Y-%m-%d").date()
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
     except Exception:
         pass
 
-    # 2) если вдруг прилетит ISO datetime
+    # 2) ISO (на всякий случай)
     try:
         return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except Exception:
         return None
 
 
-async def get_user_records(tg_id: int) -> list[dict]:
+async def get_latest_request_for_user(tg_id: int) -> dict | None:
     """
-    Берём все записи пользователя по tg_id, отсортированные по created_time DESC.
-    Не фильтруем по status на стороне Notion — потому что это может быть Select, а не Status.
+    Последняя заявка пользователя (любого статуса).
     """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
 
     data = await notion_query_database(
         filter_obj,
+        page_size=10,
+        sorts=[{"timestamp": "created_time", "direction": "descending"}],
+    )
+    results = data.get("results", [])
+    return results[0] if results else None
+
+
+async def get_active_subscription_for_user(tg_id: int) -> dict | None:
+    """
+    Возвращает APPROVED запись пользователя, которая НЕ истекла.
+    status теперь Text: "approved" / "pending" / "rejected"
+    """
+    tg_id_str = str(tg_id)
+
+    filter_obj = {
+        "and": [
+            {"property": "tg_id", "rich_text": {"equals": tg_id_str}},
+            {"property": "status", "rich_text": {"equals": "approved"}},  # <-- status = Text
+        ]
+    }
+
+    data = await notion_query_database(
+        filter_obj,
         page_size=50,
         sorts=[{"timestamp": "created_time", "direction": "descending"}],
     )
-    return data.get("results", [])
+    results = data.get("results", [])
 
-
-async def get_cabinet_state(tg_id: int) -> dict:
-    """
-    Возвращает:
-      {
-        "latest": page|None,
-        "latest_status": str,
-        "active": page|None,          # approved и не истекла
-        "active_expires": str,
-      }
-    """
-    results = await get_user_records(tg_id)
     today = datetime.utcnow().date()
 
-    latest = results[0] if results else None
-    latest_status = notion_get_choice_name(latest, "status").strip().lower() if latest else ""
-
-    active = None
-    active_expires = ""
-
     for page in results:
-        st = notion_get_choice_name(page, "status").strip().lower()
-        if st != "approved":
-            continue
+        expires_str = notion_get_prop_as_text(page, "expires_at")  # Date или Text
+        exp = parse_date_any(expires_str)
+        if exp and exp >= today:
+            return page
 
-        expires_at = notion_get_text_prop(page, "expires_at")
-        exp_date = parse_expires(expires_at)
-        if not exp_date:
-            continue
-        if exp_date < today:
-            continue
-
-        active = page
-        active_expires = expires_at
-        break  # т.к. сортировка DESC — первая подходящая будет самой свежей
-
-    return {
-        "latest": latest,
-        "latest_status": latest_status,
-        "active": active,
-        "active_expires": active_expires,
-    }
+    return None
 
 
 # =========================
@@ -233,6 +215,7 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
+    # ВАЖНО: именно web_app — это mini app
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
     ])
@@ -249,6 +232,18 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
+    """
+    Hidden-поля в Tally (короткие):
+      t  -> tg_id
+      u  -> tg_username
+      pk -> period_key
+      as -> amount_usdt
+      au -> amount_uah
+      pm -> pay_method
+      o  -> order_id
+      ex -> expires_at
+      product, period
+    """
     order_id = str(uuid.uuid4())
 
     params = {
@@ -262,6 +257,7 @@ async def send_payment_flow_final(
         "ex": expires_at,
     }
 
+    # суммы (только одна заполняется)
     if currency == "USDT":
         params["as"] = str(amount)
         params["au"] = ""
@@ -419,6 +415,8 @@ async def back_to_main_menu(message: Message):
     await message.answer("Главное меню", reply_markup=main_menu_kb())
 
 
+# --- Main menu sections ---
+
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
     await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
@@ -459,61 +457,87 @@ async def mentoring_info(message: Message):
     await message.answer("Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
-# --- Личный кабинет (READ ONLY из Notion) ---
+# --- Личный кабинет ---
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    try:
-        state = await get_cabinet_state(message.from_user.id)
+    tg_id = message.from_user.id
 
-        active = state["active"]
-        latest_status = state["latest_status"]
+    # 1) Пытаемся найти активную approved подписку (не истекла)
+    active = await get_active_subscription_for_user(tg_id)
+    if active:
+        discord = notion_get_prop_as_text(active, "discord") or "Не указан"
+        email = notion_get_prop_as_text(active, "email") or "Не указан"
+        expires_at = notion_get_prop_as_text(active, "expires_at") or "—"
+        await message.answer(
+            "👤 Личный кабинет\n\n"
+            f"Discord: <b>{discord}</b>\n"
+            f"Email: <b>{email}</b>\n\n"
+            f"Статус: <b>Подписка активна до {expires_at}</b>"
+        )
+        return
 
-        # 1) Активная подписка
-        if active:
-            discord = notion_get_text_prop(active, "discord") or "Не указан"
-            email = notion_get_text_prop(active, "email") or "Не указан"
-            expires_at = state["active_expires"] or "—"
-
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                f"Discord: <b>{discord}</b>\n"
-                f"Email: <b>{email}</b>\n\n"
-                f"Подписка: <b>Hadiukov Community</b>\n"
-                f"Действует до: <b>{expires_at}</b>"
-            )
-            return
-
-        # 2) Нет активной — но есть заявка/статус
-        if latest_status == "pending":
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                "Discord: <b>Не указан</b>\n"
-                "Email: <b>Не указан</b>\n\n"
-                "Статус: <b>Заявка на проверке</b>"
-            )
-            return
-
-        if latest_status == "rejected":
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                "Discord: <b>Не указан</b>\n"
-                "Email: <b>Не указан</b>\n\n"
-                "Статус: <b>Заявка отклонена</b>"
-            )
-            return
-
-        # 3) Вообще ничего
+    # 2) Если активной нет — смотрим последнюю заявку и её статус (Text)
+    last = await get_latest_request_for_user(tg_id)
+    if not last:
         await message.answer(
             "👤 Личный кабинет\n\n"
             "Discord: <b>Не указан</b>\n"
             "Email: <b>Не указан</b>\n\n"
             "Статус: <b>Нет активной подписки</b>"
         )
+        return
 
-    except Exception as e:
-        await message.answer(f"Ошибка кабинета: {e}")
+    status = (notion_get_prop_as_text(last, "status") or "").strip().lower()
+
+    if status == "rejected":
+        await message.answer(
+            "👤 Личный кабинет\n\n"
+            "Discord: <b>Не указан</b>\n"
+            "Email: <b>Не указан</b>\n\n"
+            f"Статус: <b>Заявка была отклонена.</b>\n"
+            f"Пожалуйста, свяжитесь с администратором: {ADMIN_USERNAME}"
+        )
+        return
+
+    if status == "pending":
+        await message.answer(
+            "👤 Личный кабинет\n\n"
+            "Discord: <b>Не указан</b>\n"
+            "Email: <b>Не указан</b>\n\n"
+            "Статус: <b>Заявка проверяется</b>"
+        )
+        return
+
+    if status == "approved":
+        # approved есть, но активной подписки нет => истекла или expires_at не заполнен
+        expires_str = notion_get_prop_as_text(last, "expires_at") or ""
+        exp = parse_date_any(expires_str)
+        if exp:
+            await message.answer(
+                "👤 Личный кабинет\n\n"
+                "Discord: <b>Не указан</b>\n"
+                "Email: <b>Не указан</b>\n\n"
+                f"Статус: <b>Подписка истекла ({expires_str})</b>"
+            )
+        else:
+            await message.answer(
+                "👤 Личный кабинет\n\n"
+                "Discord: <b>Не указан</b>\n"
+                "Email: <b>Не указан</b>\n\n"
+                "Статус: <b>Approved, но срок не найден (проверь expires_at)</b>"
+            )
+        return
+
+    # Если админ написал что-то другое
+    await message.answer(
+        "👤 Личный кабинет\n\n"
+        "Discord: <b>Не указан</b>\n"
+        "Email: <b>Не указан</b>\n\n"
+        f"Статус: <b>{status or 'не указан'}</b>"
+    )
 
 
+# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     await cb.message.delete()
@@ -538,6 +562,7 @@ async def buy_mentoring(cb: CallbackQuery):
     await cb.answer()
 
 
+# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
@@ -580,6 +605,7 @@ async def close_message(cb: CallbackQuery):
     await cb.answer()
 
 
+# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
