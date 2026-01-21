@@ -47,7 +47,7 @@ COMMUNITY_USDT_3M = 120
 COMMUNITY_UAH_1M = 2200
 COMMUNITY_UAH_3M = 5200
 
-# Mentoring
+# Mentoring (не показываем в кабинете, но оставим покупку если нужно)
 MENTORING_USDT = 3000
 MENTORING_UAH = 130000
 
@@ -69,21 +69,17 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 
-async def notion_query_database(
-    filter_obj: dict | None = None,
-    page_size: int = 50,
-    sorts: list | None = None,
-) -> dict:
+async def notion_query_database(filter_obj: dict, page_size: int = 20, sorts: list | None = None) -> dict:
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-
-    payload: dict = {"page_size": page_size}
-    if filter_obj:
-        payload["filter"] = filter_obj
+    payload = {
+        "filter": filter_obj,
+        "page_size": page_size,
+    }
     if sorts:
         payload["sorts"] = sorts
 
@@ -94,7 +90,7 @@ async def notion_query_database(
 
 
 def notion_get_text_prop(page: dict, prop_name: str) -> str:
-    """Поддерживает Text (rich_text), Title и Email."""
+    """Поддерживает Text (rich_text) и Title и Email."""
     props = page.get("properties", {})
     p = props.get(prop_name)
     if not p:
@@ -111,13 +107,23 @@ def notion_get_text_prop(page: dict, prop_name: str) -> str:
     return ""
 
 
-def notion_get_status(page: dict, prop_name: str) -> str:
+def notion_get_choice_name(page: dict, prop_name: str) -> str:
+    """
+    Возвращает name для properties типа:
+      - status
+      - select
+    """
     props = page.get("properties", {})
     p = props.get(prop_name)
     if not p:
         return ""
-    if p.get("type") == "status":
+
+    t = p.get("type")
+    if t == "status":
         s = p.get("status") or {}
+        return s.get("name", "") or ""
+    if t == "select":
+        s = p.get("select") or {}
         return s.get("name", "") or ""
     return ""
 
@@ -125,32 +131,59 @@ def notion_get_status(page: dict, prop_name: str) -> str:
 def parse_expires(expires_at_str: str) -> date | None:
     if not expires_at_str:
         return None
-    # ожидаем "YYYY-MM-DD"
+    s = expires_at_str.strip()
+
+    # 1) "YYYY-MM-DD"
     try:
-        return datetime.strptime(expires_at_str.strip(), "%Y-%m-%d").date()
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except Exception:
+        pass
+
+    # 2) если вдруг прилетит ISO datetime
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
     except Exception:
         return None
 
 
-def is_approved(status_name: str) -> bool:
-    return (status_name or "").strip().lower() == "approved"
-
-
 async def get_user_records(tg_id: int) -> list[dict]:
-    """Берём все записи пользователя и сортируем по created_time DESC (самые новые сверху)."""
+    """
+    Берём все записи пользователя по tg_id, отсортированные по created_time DESC.
+    Не фильтруем по status на стороне Notion — потому что это может быть Select, а не Status.
+    """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
-    sorts = [{"timestamp": "created_time", "direction": "descending"}]
-    data = await notion_query_database(filter_obj, page_size=50, sorts=sorts)
-    return data.get("results", []) or []
+
+    data = await notion_query_database(
+        filter_obj,
+        page_size=50,
+        sorts=[{"timestamp": "created_time", "direction": "descending"}],
+    )
+    return data.get("results", [])
 
 
-def pick_active_approved(records: list[dict]) -> dict | None:
-    """Первая подходящая (самая свежая) approved-запись, которая ещё не истекла."""
+async def get_cabinet_state(tg_id: int) -> dict:
+    """
+    Возвращает:
+      {
+        "latest": page|None,
+        "latest_status": str,
+        "active": page|None,          # approved и не истекла
+        "active_expires": str,
+      }
+    """
+    results = await get_user_records(tg_id)
     today = datetime.utcnow().date()
-    for page in records:
-        status_name = notion_get_status(page, "status")
-        if not is_approved(status_name):
+
+    latest = results[0] if results else None
+    latest_status = notion_get_choice_name(latest, "status").strip().lower() if latest else ""
+
+    active = None
+    active_expires = ""
+
+    for page in results:
+        st = notion_get_choice_name(page, "status").strip().lower()
+        if st != "approved":
             continue
 
         expires_at = notion_get_text_prop(page, "expires_at")
@@ -160,8 +193,16 @@ def pick_active_approved(records: list[dict]) -> dict | None:
         if exp_date < today:
             continue
 
-        return page
-    return None
+        active = page
+        active_expires = expires_at
+        break  # т.к. сортировка DESC — первая подходящая будет самой свежей
+
+    return {
+        "latest": latest,
+        "latest_status": latest_status,
+        "active": active,
+        "active_expires": active_expires,
+    }
 
 
 # =========================
@@ -192,7 +233,6 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
-    # ВАЖНО: именно web_app — это mini app
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
     ])
@@ -209,18 +249,6 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
-    """
-    Hidden-поля в Tally (короткие):
-      t  -> tg_id
-      u  -> tg_username
-      pk -> period_key
-      as -> amount_usdt
-      au -> amount_uah
-      pm -> pay_method
-      o  -> order_id
-      ex -> expires_at
-      product, period (если есть hidden в форме)
-    """
     order_id = str(uuid.uuid4())
 
     params = {
@@ -391,8 +419,6 @@ async def back_to_main_menu(message: Message):
     await message.answer("Главное меню", reply_markup=main_menu_kb())
 
 
-# --- Main menu sections ---
-
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
     await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
@@ -437,58 +463,57 @@ async def mentoring_info(message: Message):
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
     try:
-        records = await get_user_records(message.from_user.id)
+        state = await get_cabinet_state(message.from_user.id)
 
-        if not records:
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                "Discord: <b>Не указан</b>\n"
-                "Email: <b>Не указан</b>\n\n"
-                "Статус: <b>Нет активной подписки</b>"
-            )
-            return
+        active = state["active"]
+        latest_status = state["latest_status"]
 
-        active = pick_active_approved(records)
-
+        # 1) Активная подписка
         if active:
             discord = notion_get_text_prop(active, "discord") or "Не указан"
             email = notion_get_text_prop(active, "email") or "Не указан"
-            expires_at = notion_get_text_prop(active, "expires_at") or ""
+            expires_at = state["active_expires"] or "—"
 
             await message.answer(
                 "👤 Личный кабинет\n\n"
                 f"Discord: <b>{discord}</b>\n"
                 f"Email: <b>{email}</b>\n\n"
-                f"Подписка: <b>Hadiukov Community – {expires_at}</b>"
+                f"Подписка: <b>Hadiukov Community</b>\n"
+                f"Действует до: <b>{expires_at}</b>"
             )
             return
 
-        # Если нет активной approved, но есть запись — значит заявка есть, но на проверке/отклонена/и т.д.
-        latest = records[0]
-        discord = notion_get_text_prop(latest, "discord") or "Не указан"
-        email = notion_get_text_prop(latest, "email") or "Не указан"
-        status_name = notion_get_status(latest, "status").strip()
+        # 2) Нет активной — но есть заявка/статус
+        if latest_status == "pending":
+            await message.answer(
+                "👤 Личный кабинет\n\n"
+                "Discord: <b>Не указан</b>\n"
+                "Email: <b>Не указан</b>\n\n"
+                "Статус: <b>Заявка на проверке</b>"
+            )
+            return
 
-        # Приводим к понятному тексту
-        if is_approved(status_name):
-            status_text = "Подписка активируется (проверь expires_at)"
-        elif status_name:
-            status_text = "Заявка на проверке" if status_name.lower() != "rejected" else "Заявка отклонена"
-        else:
-            status_text = "Заявка на проверке"
+        if latest_status == "rejected":
+            await message.answer(
+                "👤 Личный кабинет\n\n"
+                "Discord: <b>Не указан</b>\n"
+                "Email: <b>Не указан</b>\n\n"
+                "Статус: <b>Заявка отклонена</b>"
+            )
+            return
 
+        # 3) Вообще ничего
         await message.answer(
             "👤 Личный кабинет\n\n"
-            f"Discord: <b>{discord}</b>\n"
-            f"Email: <b>{email}</b>\n\n"
-            f"Статус: <b>{status_text}</b>"
+            "Discord: <b>Не указан</b>\n"
+            "Email: <b>Не указан</b>\n\n"
+            "Статус: <b>Нет активной подписки</b>"
         )
 
     except Exception as e:
         await message.answer(f"Ошибка кабинета: {e}")
 
 
-# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     await cb.message.delete()
@@ -513,7 +538,6 @@ async def buy_mentoring(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
@@ -556,7 +580,6 @@ async def close_message(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
