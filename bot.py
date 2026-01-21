@@ -2,6 +2,7 @@ import uuid
 import asyncio
 from datetime import datetime, date
 from urllib.parse import urlencode, quote
+import time
 
 import httpx
 from dateutil.relativedelta import relativedelta
@@ -58,7 +59,7 @@ PERIOD_MONTHS = {"1m": 1, "3m": 3}
 # BOT INIT
 # =========================
 
-# ✅ ВАЖНО: без aiohttp.ClientTimeout, иначе Koyeb может падать как на твоём скрине
+# ✅ ВАЖНО: без aiohttp.ClientTimeout, чтобы не было падения как на твоём скрине
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
@@ -74,7 +75,6 @@ async def safe_answer(message: Message, text: str, *, reply_markup=None, retries
         except TelegramNetworkError as e:
             last_err = e
             await asyncio.sleep(1.0)
-    # если совсем плохо — покажем 1 раз, чтобы ты видел
     raise last_err
 
 
@@ -84,6 +84,17 @@ async def safe_answer(message: Message, text: str, *, reply_markup=None, retries
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
+
+_notion_client: httpx.AsyncClient | None = None
+
+
+def _get_notion_client() -> httpx.AsyncClient:
+    global _notion_client
+    if _notion_client is None or _notion_client.is_closed:
+        # limits помогают меньше упираться в сеть на маленьком инстансе
+        limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
+        _notion_client = httpx.AsyncClient(timeout=60, limits=limits)
+    return _notion_client
 
 
 async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
@@ -102,13 +113,17 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
         "sorts": [{"timestamp": "created_time", "direction": "descending"}],
     }
 
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
+    client = _get_notion_client()
+    r = await client.post(url, headers=headers, json=payload)
+    r.raise_for_status()
+    return r.json()
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
+    """
+    Читает Notion Text (rich_text) как строку.
+    У тебя tg_id/discord/email/expires_at = text => это rich_text в API.
+    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -141,6 +156,9 @@ def _status_name(props: dict, prop_name: str = "status") -> str:
 
 
 def _parse_expires(expires_at_str: str) -> date | None:
+    """
+    expires_at хранится как TEXT 'YYYY-MM-DD'
+    """
     if not expires_at_str:
         return None
     try:
@@ -150,6 +168,9 @@ def _parse_expires(expires_at_str: str) -> date | None:
 
 
 async def get_latest_request_for_user(tg_id: int) -> dict | None:
+    """
+    Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса).
+    """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
     data = await notion_query_database(filter_obj, page_size=10)
@@ -158,16 +179,40 @@ async def get_latest_request_for_user(tg_id: int) -> dict | None:
 
 
 # =========================
+# CABINET CACHE (чтобы не спамить Notion при 30 кликах)
+# =========================
+
+_CABINET_CACHE_TTL = 5  # сек
+_cabinet_cache: dict[int, tuple[float, str]] = {}  # tg_id -> (ts, text)
+
+
+def _cache_get(tg_id: int) -> str | None:
+    v = _cabinet_cache.get(tg_id)
+    if not v:
+        return None
+    ts, text = v
+    if time.time() - ts <= _CABINET_CACHE_TTL:
+        return text
+    return None
+
+
+def _cache_set(tg_id: int, text: str) -> None:
+    _cabinet_cache[tg_id] = (time.time(), text)
+
+
+# =========================
 # HELPERS
 # =========================
 
 def expires_from_key(key: str) -> str:
-    # expires_at хранится как TEXT 'YYYY-MM-DD'
     months = int(PERIOD_MONTHS[key])
     return (datetime.utcnow() + relativedelta(months=months)).strftime("%Y-%m-%d")
 
 
 def build_tally_url(params: dict) -> str:
+    """
+    quote (а не quote_plus), и добавляем _tail чтобы tgWebAppData не прилипал.
+    """
     params = dict(params)
     params["_tail"] = "1"
     query = urlencode(params, quote_via=quote)
@@ -179,7 +224,6 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
     except TelegramNetworkError:
-        # Telegram timeout — попробуем обычным текстом
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
     except Exception:
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
@@ -204,6 +248,18 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
+    """
+    Hidden-поля в Tally:
+      t  -> tg_id
+      u  -> tg_username
+      pk -> period_key
+      as -> amount_usdt
+      au -> amount_uah
+      pm -> pay_method
+      o  -> order_id
+      ex -> expires_at
+      product, period
+    """
     order_id = str(uuid.uuid4())
 
     params = {
@@ -400,8 +456,18 @@ async def mentoring_info(message: Message):
     await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
+# --- Личный кабинет ---
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
+    # если 30 раз нажали — отдадим кеш на 5 сек, чтобы не душить Notion
+    cached = _cache_get(message.from_user.id)
+    if cached:
+        try:
+            await safe_answer(message, cached)
+        except TelegramNetworkError:
+            return
+        return
+
     discord = "Не указан"
     email = "Не указан"
     status_text = "Нет активной подписки"
@@ -411,17 +477,20 @@ async def cabinet_from_menu(message: Message):
 
         if page:
             props = page.get("properties", {})
-            st = _status_name(props, "status")
+            st = _status_name(props, "status")  # pending/approved/rejected
             expires_raw = _rt_plain(props, "expires_at")
             expires_dt = _parse_expires(expires_raw)
 
             if st == "pending":
                 status_text = "Заявка на проверке"
+
             elif st == "rejected":
                 status_text = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
+
             elif st == "approved":
                 d = _rt_plain(props, "discord")
                 e = _rt_plain(props, "email")
+
                 if d:
                     discord = d
                 if e:
@@ -434,6 +503,7 @@ async def cabinet_from_menu(message: Message):
                         status_text = f"Подписка истекла: {expires_dt.isoformat()}"
                 else:
                     status_text = "Активна (дата не указана)"
+
             else:
                 status_text = "Заявка на проверке"
 
@@ -443,17 +513,22 @@ async def cabinet_from_menu(message: Message):
             f"Email: <b>{email}</b>\n\n"
             f"Статус: <b>{status_text}</b>"
         )
+
+        _cache_set(message.from_user.id, text)
         await safe_answer(message, text)
 
-    except httpx.TimeoutException:
-        await safe_answer(message, "Ошибка кабинета: Notion не ответил вовремя (timeout). Попробуй ещё раз через 10–20 сек.")
-    except TelegramNetworkError:
-        # если даже Telegram не отвечает — просто молча не валим процесс
-        return
+    except (httpx.TimeoutException, TelegramNetworkError):
+        # ОДИНАКОВОЕ сообщение для обеих ошибок (как ты попросил)
+        try:
+            await safe_answer(message, "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз.")
+        except TelegramNetworkError:
+            return
+
     except Exception as e:
         await safe_answer(message, f"Ошибка кабинета: {e}")
 
 
+# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     await cb.message.delete()
@@ -478,6 +553,7 @@ async def buy_mentoring(cb: CallbackQuery):
     await cb.answer()
 
 
+# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
@@ -500,10 +576,12 @@ async def close_message(cb: CallbackQuery):
     await cb.answer()
 
 
+# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
+    # ✅ ВАЖНО: тут используем cb.from_user (это реальный юзер), а НЕ cb.message.from_user (это бот).
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
@@ -575,8 +653,18 @@ async def subscription_selected(cb: CallbackQuery):
     await cb.answer()
 
 
+# =========================
+# RUN
+# =========================
+
 async def main():
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        global _notion_client
+        if _notion_client and not _notion_client.is_closed:
+            await _notion_client.aclose()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
