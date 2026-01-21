@@ -59,7 +59,6 @@ PERIOD_MONTHS = {"1m": 1, "3m": 3}
 # BOT INIT
 # =========================
 
-# ✅ ВАЖНО: без aiohttp.ClientTimeout, чтобы не было падения как на твоём скрине
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
@@ -91,16 +90,12 @@ _notion_client: httpx.AsyncClient | None = None
 def _get_notion_client() -> httpx.AsyncClient:
     global _notion_client
     if _notion_client is None or _notion_client.is_closed:
-        # limits помогают меньше упираться в сеть на маленьком инстансе
         limits = httpx.Limits(max_keepalive_connections=5, max_connections=10)
         _notion_client = httpx.AsyncClient(timeout=60, limits=limits)
     return _notion_client
 
 
 async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
-    """
-    Query Notion DB. Таймаут больше, чтобы не ловить random timeout на слабом инстансе.
-    """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
@@ -120,10 +115,6 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
-    """
-    Читает Notion Text (rich_text) как строку.
-    У тебя tg_id/discord/email/expires_at = text => это rich_text в API.
-    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -136,10 +127,6 @@ def _rt_plain(props: dict, prop_name: str) -> str:
 
 
 def _status_name(props: dict, prop_name: str = "status") -> str:
-    """
-    Читает Notion Status как name.
-    Если вдруг сделаешь status обычным Text — тоже отработает (через rich_text).
-    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -156,9 +143,6 @@ def _status_name(props: dict, prop_name: str = "status") -> str:
 
 
 def _parse_expires(expires_at_str: str) -> date | None:
-    """
-    expires_at хранится как TEXT 'YYYY-MM-DD'
-    """
     if not expires_at_str:
         return None
     try:
@@ -168,9 +152,6 @@ def _parse_expires(expires_at_str: str) -> date | None:
 
 
 async def get_latest_request_for_user(tg_id: int) -> dict | None:
-    """
-    Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса).
-    """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
     data = await notion_query_database(filter_obj, page_size=10)
@@ -179,7 +160,7 @@ async def get_latest_request_for_user(tg_id: int) -> dict | None:
 
 
 # =========================
-# CABINET CACHE (чтобы не спамить Notion при 30 кликах)
+# CABINET CACHE (anti-spam Notion)
 # =========================
 
 _CABINET_CACHE_TTL = 5  # сек
@@ -200,6 +181,10 @@ def _cache_set(tg_id: int, text: str) -> None:
     _cabinet_cache[tg_id] = (time.time(), text)
 
 
+def _cache_invalidate(tg_id: int) -> None:
+    _cabinet_cache.pop(tg_id, None)
+
+
 # =========================
 # HELPERS
 # =========================
@@ -210,9 +195,6 @@ def expires_from_key(key: str) -> str:
 
 
 def build_tally_url(params: dict) -> str:
-    """
-    quote (а не quote_plus), и добавляем _tail чтобы tgWebAppData не прилипал.
-    """
     params = dict(params)
     params["_tail"] = "1"
     query = urlencode(params, quote_via=quote)
@@ -248,18 +230,6 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
-    """
-    Hidden-поля в Tally:
-      t  -> tg_id
-      u  -> tg_username
-      pk -> period_key
-      as -> amount_usdt
-      au -> amount_uah
-      pm -> pay_method
-      o  -> order_id
-      ex -> expires_at
-      product, period
-    """
     order_id = str(uuid.uuid4())
 
     params = {
@@ -388,6 +358,12 @@ def kb_mentoring_fiat() -> InlineKeyboardMarkup:
     ])
 
 
+def kb_cabinet_refresh() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Обновить", callback_data="cabinet:refresh")]
+    ])
+
+
 # =========================
 # TEXTS
 # =========================
@@ -399,6 +375,77 @@ WELCOME_TEXT = (
     "Выберите нужный раздел в меню снизу 👇\n"
     f"Если возникнут вопросы — напишите администратору {ADMIN_USERNAME}."
 )
+
+CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
+
+# =========================
+# CABINET CORE
+# =========================
+
+async def build_cabinet_text(user_id: int) -> str:
+    discord = "Не указан"
+    email = "Не указан"
+    status_text = "Нет активной подписки"
+
+    page = await get_latest_request_for_user(user_id)
+
+    if page:
+        props = page.get("properties", {})
+        st = _status_name(props, "status")
+        expires_raw = _rt_plain(props, "expires_at")
+        expires_dt = _parse_expires(expires_raw)
+
+        if st == "pending":
+            status_text = "Заявка на проверке"
+        elif st == "rejected":
+            status_text = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
+        elif st == "approved":
+            d = _rt_plain(props, "discord")
+            e = _rt_plain(props, "email")
+
+            if d:
+                discord = d
+            if e:
+                email = e
+
+            if expires_dt:
+                if expires_dt >= date.today():
+                    status_text = f"Активна до: {expires_dt.isoformat()}"
+                else:
+                    status_text = f"Подписка истекла: {expires_dt.isoformat()}"
+            else:
+                status_text = "Активна (дата не указана)"
+        else:
+            status_text = "Заявка на проверке"
+
+    return (
+        "👤 Личный кабинет\n\n"
+        f"Discord: <b>{discord}</b>\n"
+        f"Email: <b>{email}</b>\n\n"
+        f"Статус: <b>{status_text}</b>"
+    )
+
+
+async def send_cabinet(message: Message, *, force_refresh: bool = False):
+    user_id = message.from_user.id
+
+    if force_refresh:
+        _cache_invalidate(user_id)
+    else:
+        cached = _cache_get(user_id)
+        if cached:
+            await safe_answer(message, cached, reply_markup=kb_cabinet_refresh())
+            return
+
+    try:
+        text = await build_cabinet_text(user_id)
+        _cache_set(user_id, text)
+        await safe_answer(message, text, reply_markup=kb_cabinet_refresh())
+    except (httpx.TimeoutException, TelegramNetworkError):
+        await safe_answer(message, CABINET_RETRY_TEXT, reply_markup=kb_cabinet_refresh())
+    except Exception as e:
+        await safe_answer(message, f"Ошибка кабинета: {e}", reply_markup=kb_cabinet_refresh())
+
 
 # =========================
 # HANDLERS
@@ -456,76 +503,29 @@ async def mentoring_info(message: Message):
     await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
-# --- Личный кабинет ---
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    # если 30 раз нажали — отдадим кеш на 5 сек, чтобы не душить Notion
-    cached = _cache_get(message.from_user.id)
-    if cached:
-        try:
-            await safe_answer(message, cached)
-        except TelegramNetworkError:
-            return
-        return
+    await send_cabinet(message, force_refresh=False)
 
-    discord = "Не указан"
-    email = "Не указан"
-    status_text = "Нет активной подписки"
 
+# Inline: Cabinet refresh (удаляет текущее сообщение и присылает заново)
+@dp.callback_query(F.data == "cabinet:refresh")
+async def cabinet_refresh(cb: CallbackQuery):
     try:
-        page = await get_latest_request_for_user(message.from_user.id)
-
-        if page:
-            props = page.get("properties", {})
-            st = _status_name(props, "status")  # pending/approved/rejected
-            expires_raw = _rt_plain(props, "expires_at")
-            expires_dt = _parse_expires(expires_raw)
-
-            if st == "pending":
-                status_text = "Заявка на проверке"
-
-            elif st == "rejected":
-                status_text = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
-
-            elif st == "approved":
-                d = _rt_plain(props, "discord")
-                e = _rt_plain(props, "email")
-
-                if d:
-                    discord = d
-                if e:
-                    email = e
-
-                if expires_dt:
-                    if expires_dt >= date.today():
-                        status_text = f"Активна до: {expires_dt.isoformat()}"
-                    else:
-                        status_text = f"Подписка истекла: {expires_dt.isoformat()}"
-                else:
-                    status_text = "Активна (дата не указана)"
-
-            else:
-                status_text = "Заявка на проверке"
-
-        text = (
-            "👤 Личный кабинет\n\n"
-            f"Discord: <b>{discord}</b>\n"
-            f"Email: <b>{email}</b>\n\n"
-            f"Статус: <b>{status_text}</b>"
-        )
-
-        _cache_set(message.from_user.id, text)
-        await safe_answer(message, text)
-
-    except (httpx.TimeoutException, TelegramNetworkError):
-        # ОДИНАКОВОЕ сообщение для обеих ошибок (как ты попросил)
+        # Удаляем текущее сообщение кабинета (чтобы не засорять чат)
         try:
-            await safe_answer(message, "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз.")
-        except TelegramNetworkError:
-            return
+            await cb.message.delete()
+        except Exception:
+            # если удалить не удалось — не критично
+            pass
 
-    except Exception as e:
-        await safe_answer(message, f"Ошибка кабинета: {e}")
+        # Отправляем заново, как будто пользователь снова нажал "Личный кабинет"
+        # Важно: форсим обновление (без кеша)
+        await send_cabinet(cb.message, force_refresh=True)
+
+    finally:
+        # чтобы убрать "часики" на кнопке
+        await cb.answer()
 
 
 # --- Inline: Buy / Acquire ---
@@ -581,7 +581,6 @@ async def close_message(cb: CallbackQuery):
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
-    # ✅ ВАЖНО: тут используем cb.from_user (это реальный юзер), а НЕ cb.message.from_user (это бот).
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
