@@ -27,27 +27,22 @@ from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
 ADMIN_USERNAME = "@name"  # поменяешь потом
 
-# Resources links
 YOUTUBE_URL = "https://youtube.com/@hadiukov?si=vy9gXXiLKeDYIfR_"
 INSTAGRAM_URL = "https://www.instagram.com/hadiukov?igsh=MTdtZmp4MmtxdzF2dw=="
 TELEGRAM_URL = "https://t.me/hadiukov"
 
-# Images (пути в репо)
 RESOURCES_IMAGE_PATH = "pictures/resources.png"
 PRODUCTS_IMAGE_PATH = "pictures/products.png"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
 SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
 
-# Wallet
 USDT_TRC20_ADDRESS = "TAzH2VDmTZnmAjgwDUUVDDFGntpWk7a5kQ"
 
-# Prices
 COMMUNITY_USDT_1M = 50
 COMMUNITY_USDT_3M = 120
 COMMUNITY_UAH_1M = 2200
 COMMUNITY_UAH_3M = 5200
 
-# Mentoring (не показываем в кабинете, но оставим покупку если нужно)
 MENTORING_USDT = 3000
 MENTORING_UAH = 130000
 
@@ -62,131 +57,114 @@ bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # =========================
-# NOTION (READ ONLY) - FIXED
+# NOTION
 # =========================
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
+# таймаут + ретраи, чтобы не ловить Request timeout
+NOTION_TIMEOUT = 60
+NOTION_RETRIES = 3
 
-async def notion_query_database(filter_obj: dict | None = None, page_size: int = 50) -> dict:
+
+async def notion_query_database(filter_obj: dict, page_size: int = 20) -> dict:
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-    payload: dict = {"page_size": page_size}
-    if filter_obj:
-        payload["filter"] = filter_obj
+    payload = {
+        "filter": filter_obj,
+        "page_size": page_size,
+    }
 
-    timeout = httpx.Timeout(30.0, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        r = await client.post(url, headers=headers, json=payload)
-        r.raise_for_status()
-        return r.json()
+    last_err = None
+    for attempt in range(1, NOTION_RETRIES + 1):
+        try:
+            async with httpx.AsyncClient(timeout=NOTION_TIMEOUT) as client:
+                r = await client.post(url, headers=headers, json=payload)
+                r.raise_for_status()
+                return r.json()
+        except Exception as e:
+            last_err = e
+            # маленький бэкофф
+            await asyncio.sleep(0.6 * attempt)
+
+    raise last_err
 
 
-def notion_get_plain(page: dict, prop_name: str) -> str:
-    """
-    Достаёт значение свойства как строку для разных типов:
-    rich_text/title/email/status/select/date/number.
-    """
-    props = page.get("properties", {})
+def _rt_plain(props: dict, prop_name: str) -> str:
+    """Text (rich_text) -> plain_text"""
     p = props.get(prop_name)
     if not p:
         return ""
-
-    t = p.get("type")
-
-    if t == "rich_text":
-        arr = p.get("rich_text", [])
-        return arr[0].get("plain_text", "") if arr else ""
-
-    if t == "title":
-        arr = p.get("title", [])
-        return arr[0].get("plain_text", "") if arr else ""
-
-    if t == "email":
-        return p.get("email") or ""
-
-    if t == "status":
-        s = p.get("status") or {}
-        return s.get("name", "") or ""
-
-    if t == "select":
-        s = p.get("select") or {}
-        return s.get("name", "") or ""
-
-    if t == "date":
-        d = p.get("date") or {}
-        return (d.get("start") or "").strip()
-
-    if t == "number":
-        n = p.get("number")
-        return "" if n is None else str(int(n) if float(n).is_integer() else n)
-
-    return ""
+    if p.get("type") != "rich_text":
+        return ""
+    arr = p.get("rich_text", [])
+    return arr[0].get("plain_text", "").strip() if arr else ""
 
 
-def parse_date_any(s: str) -> date | None:
-    """Понимает 'YYYY-MM-DD' и 'YYYY-MM-DDTHH:MM:SS...'."""
-    if not s:
+def _title_plain(props: dict, prop_name: str) -> str:
+    """Title -> plain_text (на всякий случай)"""
+    p = props.get(prop_name)
+    if not p:
+        return ""
+    if p.get("type") != "title":
+        return ""
+    arr = p.get("title", [])
+    return arr[0].get("plain_text", "").strip() if arr else ""
+
+
+def _status_name(props: dict, prop_name: str) -> str:
+    """Status -> name"""
+    p = props.get(prop_name)
+    if not p:
+        return ""
+    if p.get("type") != "status":
+        return ""
+    s = p.get("status") or {}
+    return (s.get("name") or "").strip().lower()
+
+
+def _parse_expires(expires_at_str: str) -> date | None:
+    if not expires_at_str:
         return None
-    s = s.strip()
     try:
-        if len(s) == 10 and s[4] == "-" and s[7] == "-":
-            return datetime.strptime(s, "%Y-%m-%d").date()
-        return datetime.fromisoformat(s.replace("Z", "+00:00")).date()
+        return datetime.strptime(expires_at_str.strip(), "%Y-%m-%d").date()
     except Exception:
         return None
 
 
-async def get_user_records(tg_id: int) -> list[dict]:
-    """Пытается найти записи по tg_id и для Text, и для Number."""
+async def get_latest_request_for_user(tg_id: int) -> dict | None:
+    """
+    Берём ПОСЛЕДНЮЮ заявку пользователя (pending/rejected/approved),
+    чтобы кабинет всегда показывал актуальный статус.
+    """
     tg_id_str = str(tg_id)
 
-    # 1) как Text (rich_text)
-    try:
-        data = await notion_query_database(
+    filter_obj = {
+        "and": [
             {"property": "tg_id", "rich_text": {"equals": tg_id_str}},
-            page_size=50
-        )
-        results = data.get("results", [])
-        if results:
-            return results
-    except Exception:
-        pass
+        ]
+    }
 
-    # 2) как Number
-    try:
-        data = await notion_query_database(
-            {"property": "tg_id", "number": {"equals": tg_id}},
-            page_size=50
-        )
-        return data.get("results", [])
-    except Exception:
-        return []
-
-
-def get_created_dt(page: dict) -> datetime:
-    ct = page.get("created_time", "")
-    try:
-        return datetime.fromisoformat(ct.replace("Z", "+00:00"))
-    except Exception:
-        return datetime.min
-
-
-async def get_best_record_for_cabinet(tg_id: int) -> dict | None:
-    """
-    Берём самую свежую запись пользователя (по created_time).
-    Дальше по status решаем что показывать.
-    """
-    rows = await get_user_records(tg_id)
-    if not rows:
+    data = await notion_query_database(filter_obj, page_size=50)
+    results = data.get("results", [])
+    if not results:
         return None
-    rows.sort(key=get_created_dt, reverse=True)
-    return rows[0]
+
+    # выбираем самую свежую по created_time (системное поле страницы)
+    def created_dt(page: dict):
+        s = page.get("created_time", "")
+        try:
+            return datetime.fromisoformat(s.replace("Z", "+00:00"))
+        except Exception:
+            return datetime.min
+
+    results.sort(key=created_dt, reverse=True)
+    return results[0]
 
 
 # =========================
@@ -199,11 +177,8 @@ def expires_from_key(key: str) -> str:
 
 
 def build_tally_url(params: dict) -> str:
-    """
-    Важно: используем quote (а не quote_plus), чтобы mini app не ловил странные ссылки.
-    """
     params = dict(params)
-    params["_tail"] = "1"  # чтобы tgWebAppData не прилипал к последнему параметру
+    params["_tail"] = "1"
     query = urlencode(params, quote_via=quote)
     return f"{TALLY_FORM_URL}?{query}"
 
@@ -217,7 +192,6 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
-    # ВАЖНО: именно web_app — это mini app
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
     ])
@@ -234,19 +208,6 @@ async def send_payment_flow_final(
     period_text: str = "",
     expires_at: str = "",
 ):
-    """
-    Генерим ссылку на Tally и открываем мини-приложением.
-    Hidden-поля в Tally (короткие):
-      t  -> tg_id
-      u  -> tg_username
-      pk -> period_key
-      as -> amount_usdt
-      au -> amount_uah
-      pm -> pay_method
-      o  -> order_id
-      ex -> expires_at
-      product, period (можешь оставить, если есть hidden)
-    """
     order_id = str(uuid.uuid4())
 
     params = {
@@ -260,7 +221,6 @@ async def send_payment_flow_final(
         "ex": expires_at,
     }
 
-    # суммы (только одна заполняется)
     if currency == "USDT":
         params["as"] = str(amount)
         params["au"] = ""
@@ -289,17 +249,9 @@ async def send_payment_flow_final(
 def main_menu_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [
-                KeyboardButton(text="ℹ️ Информация"),
-                KeyboardButton(text="❓ Помощь"),
-            ],
-            [
-                KeyboardButton(text="📦 Мои продукты"),
-                KeyboardButton(text="🌐 Мои ресурсы"),
-            ],
-            [
-                KeyboardButton(text="👤 Личный кабинет"),
-            ],
+            [KeyboardButton(text="ℹ️ Информация"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="📦 Мои продукты"), KeyboardButton(text="🌐 Мои ресурсы")],
+            [KeyboardButton(text="👤 Личный кабинет")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -418,8 +370,6 @@ async def back_to_main_menu(message: Message):
     await message.answer("Главное меню", reply_markup=main_menu_kb())
 
 
-# --- Main menu sections ---
-
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
     await message.answer("ℹ️ Раздел «Информация» пока в разработке.")
@@ -438,10 +388,7 @@ async def resources_from_menu(message: Message):
         caption="Подписывайтесь ⬇️⬇️⬇️",
         reply_markup=resources_links_kb(),
     )
-    await message.answer(
-        "Чтобы вернуться, нажмите «В главное меню».",
-        reply_markup=resources_back_kb(),
-    )
+    await message.answer("Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
 
 
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
@@ -460,88 +407,61 @@ async def mentoring_info(message: Message):
     await message.answer("Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
-# --- Личный кабинет (FIXED: читает Date/Text/Status/Select нормально) ---
+# =========================
+# ЛИЧНЫЙ КАБИНЕТ (главный фикс)
+# =========================
+
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
     try:
-        page = await get_best_record_for_cabinet(message.from_user.id)
+        page = await get_latest_request_for_user(message.from_user.id)
 
-        if not page:
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                "Discord: <b>Не указан</b>\n"
-                "Email: <b>Не указан</b>\n\n"
-                "Статус: <b>Нет активной подписки</b>"
-            )
-            return
+        # дефолты
+        discord = "Не указан"
+        email = "Не указан"
+        status_text = "Нет активной подписки"
 
-        status = notion_get_plain(page, "status").strip().lower()
-        discord = notion_get_plain(page, "discord").strip()
-        email = notion_get_plain(page, "email").strip()
-        expires_at_raw = notion_get_plain(page, "expires_at").strip()
-        exp_date = parse_date_any(expires_at_raw)
+        if page:
+            props = page.get("properties", {})
+            st = _status_name(props, "status")  # pending/approved/rejected
 
-        if not discord:
-            discord = "Не указан"
-        if not email:
-            email = "Не указан"
+            expires_raw = _rt_plain(props, "expires_at")
+            expires_dt = _parse_expires(expires_raw)
 
-        if status == "rejected":
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                "Discord: <b>Не указан</b>\n"
-                "Email: <b>Не указан</b>\n\n"
-                f"Статус: <b>Заявка была отклонена</b>\n"
-                f"Пожалуйста, свяжитесь с администратором: {ADMIN_USERNAME}"
-            )
-            return
+            if st == "pending":
+                status_text = "Заявка на проверке"
 
-        if status == "pending" or status == "":
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                "Discord: <b>Не указан</b>\n"
-                "Email: <b>Не указан</b>\n\n"
-                "Статус: <b>Заявка проверяется</b>"
-            )
-            return
+            elif st == "rejected":
+                status_text = f"Заявка отклонена. Напишите администратору: {ADMIN_USERNAME}"
 
-        if status == "approved":
-            if not exp_date:
-                await message.answer(
-                    "👤 Личный кабинет\n\n"
-                    f"Discord: <b>{discord}</b>\n"
-                    f"Email: <b>{email}</b>\n\n"
-                    "Подписка: <b>Активна</b>"
-                )
-                return
+            elif st == "approved":
+                d = _rt_plain(props, "discord")
+                e = _rt_plain(props, "email")
 
-            today = datetime.utcnow().date()
-            if exp_date < today:
-                await message.answer(
-                    "👤 Личный кабинет\n\n"
-                    f"Discord: <b>{discord}</b>\n"
-                    f"Email: <b>{email}</b>\n\n"
-                    f"Подписка: <b>Истекла {exp_date.strftime('%Y-%m-%d')}</b>"
-                )
-                return
+                if d:
+                    discord = d
+                if e:
+                    email = e
 
-            await message.answer(
-                "👤 Личный кабинет\n\n"
-                f"Discord: <b>{discord}</b>\n"
-                f"Email: <b>{email}</b>\n\n"
-                f"Подписка: <b>Активна до {exp_date.strftime('%Y-%m-%d')}</b>"
-            )
-            return
+                if expires_dt:
+                    if expires_dt >= date.today():
+                        status_text = f"Активна до: {expires_dt.isoformat()}"
+                    else:
+                        status_text = f"Подписка истекла: {expires_dt.isoformat()}"
+                else:
+                    status_text = "Активна (дата не указана)"
+            else:
+                # если статус пустой/другой — считаем что проверка
+                status_text = "Заявка на проверке"
 
-        await message.answer(
+        text = (
             "👤 Личный кабинет\n\n"
             f"Discord: <b>{discord}</b>\n"
             f"Email: <b>{email}</b>\n\n"
-            f"Статус: <b>{status}</b>"
+            f"Статус: <b>{status_text}</b>"
         )
+        await message.answer(text)
 
-    except httpx.TimeoutException:
-        await message.answer("Ошибка кабинета: Request timeout (Notion долго отвечает).")
     except Exception as e:
         await message.answer(f"Ошибка кабинета: {e}")
 
@@ -571,7 +491,6 @@ async def buy_mentoring(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- Inline: Payment method -> Subscription choices ---
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
@@ -614,7 +533,6 @@ async def close_message(cb: CallbackQuery):
     await cb.answer()
 
 
-# --- Inline: Subscription selected -> Final instructions + Tally ---
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
