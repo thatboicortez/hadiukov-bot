@@ -193,7 +193,7 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+    return InlineKeyboardMarkup(inline_keyboard=[ 
         [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
     ])
 
@@ -509,119 +509,4 @@ async def buy_community(cb: CallbackQuery):
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
     await cb.message.delete()
-    await send_photo_safe(
-        cb.message,
-        PAYMENT_IMAGE_PATH,
-        caption="Выберите способ оплаты",
-        reply_markup=kb_payment_methods("mentoring"),
-    )
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("pm:"))
-async def payment_method_choice(cb: CallbackQuery):
-    _, product_key, method = cb.data.split(":")
-
-    if product_key == "community" and method == "crypto":
-        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_crypto_periods())
-    elif product_key == "community" and method == "fiat":
-        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_fiat_periods())
-    elif product_key == "mentoring" and method == "crypto":
-        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_crypto())
-    elif product_key == "mentoring" and method == "fiat":
-        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_fiat())
-
-    await cb.answer()
-
-
-@dp.callback_query(F.data == "close")
-async def close_message(cb: CallbackQuery):
-    await cb.message.delete()
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("sub:"))
-async def subscription_selected(cb: CallbackQuery):
-    _, product_key, method, choice = cb.data.split(":")
-
-    # ВАЖНО: cb.from_user — это реальный пользователь
-    user_id = cb.from_user.id
-    user_username = cb.from_user.username or ""
-
-    if product_key == "community":
-        product_name = "Hadiukov Community"
-        period_key = choice if choice in ("1m", "3m") else ""
-        period_text = PERIOD_TEXT.get(period_key, "")
-        expires_at = expires_from_key(period_key) if period_key else ""
-
-        if method == "crypto":
-            amount = COMMUNITY_USDT_1M if choice == "1m" else COMMUNITY_USDT_3M
-            await send_payment_flow_final(
-                cb.message,
-                tg_id=user_id,
-                tg_username=user_username,
-                product=product_name,
-                pay_method="Crypto (USDT)",
-                currency="USDT",
-                amount=amount,
-                period_key=period_key,
-                period_text=period_text,
-                expires_at=expires_at,
-            )
-        else:
-            amount = COMMUNITY_UAH_1M if choice == "1m" else COMMUNITY_UAH_3M
-            await send_payment_flow_final(
-                cb.message,
-                tg_id=user_id,
-                tg_username=user_username,
-                product=product_name,
-                pay_method="Fiat (UAH)",
-                currency="UAH",
-                amount=amount,
-                period_key=period_key,
-                period_text=period_text,
-                expires_at=expires_at,
-            )
-
-    elif product_key == "mentoring":
-        product_name = "Hadiukov Mentoring"
-
-        if method == "crypto":
-            await send_payment_flow_final(
-                cb.message,
-                tg_id=user_id,
-                tg_username=user_username,
-                product=product_name,
-                pay_method="Crypto (USDT)",
-                currency="USDT",
-                amount=MENTORING_USDT,
-                period_key="mentoring",
-                period_text="Mentoring",
-                expires_at="",
-            )
-        else:
-            await send_payment_flow_final(
-                cb.message,
-                tg_id=user_id,
-                tg_username=user_username,
-                product=product_name,
-                pay_method="Fiat (UAH)",
-                currency="UAH",
-                amount=MENTORING_UAH,
-                period_key="mentoring",
-                period_text="Mentoring",
-                expires_at="",
-            )
-
-    await cb.answer()
-
-
-# =========================
-# RUN
-# =========================
-
-async def main():
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    await send
