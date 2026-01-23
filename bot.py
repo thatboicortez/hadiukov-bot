@@ -78,6 +78,19 @@ async def safe_answer(message: Message, text: str, *, reply_markup=None, retries
     return None  # не валим процесс
 
 
+async def safe_send(chat_id: int, text: str, *, reply_markup=None, retries: int = 2):
+    """
+    Надёжная отправка напрямую через bot.send_message по chat_id.
+    Полезно, когда исходное сообщение уже удалили (например при refresh).
+    """
+    for _ in range(retries):
+        try:
+            return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
+        except TelegramNetworkError:
+            await asyncio.sleep(1.0)
+    return None
+
+
 # =========================
 # NOTION (READ ONLY)
 # =========================
@@ -193,7 +206,7 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[ 
+    return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
     ])
 
@@ -358,6 +371,7 @@ WELCOME_TEXT = (
 )
 
 CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
+CABINET_LOADING_TEXT = "⏳ Загружаю личный кабинет..."
 
 
 # =========================
@@ -406,17 +420,28 @@ async def build_cabinet_text(user_id: int) -> str:
     )
 
 
-async def send_cabinet(message: Message, user_id: int):
+async def send_cabinet_to_chat(chat_id: int, user_id: int, *, show_loading: bool = True):
     """
     Единая функция отправки кабинета с кнопкой "Обновить".
+    Делает быстрый "отклик" (loading) и потом удаляет его.
     """
+    loading_msg = None
+    if show_loading:
+        loading_msg = await safe_send(chat_id, CABINET_LOADING_TEXT)
+
     try:
         text = await build_cabinet_text(user_id)
-        await safe_answer(message, text, reply_markup=cabinet_refresh_kb())
+        await safe_send(chat_id, text, reply_markup=cabinet_refresh_kb())
     except (httpx.TimeoutException, TelegramNetworkError):
-        await safe_answer(message, CABINET_RETRY_TEXT)
+        await safe_send(chat_id, CABINET_RETRY_TEXT)
     except Exception as e:
-        await safe_answer(message, f"Ошибка кабинета: {e}")
+        await safe_send(chat_id, f"Ошибка кабинета: {e}")
+    finally:
+        if loading_msg:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=loading_msg.message_id)
+            except Exception:
+                pass
 
 
 # =========================
@@ -477,36 +502,186 @@ async def mentoring_info(message: Message):
 
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    await send_cabinet(message, message.from_user.id)
+    await send_cabinet_to_chat(message.chat.id, message.from_user.id, show_loading=True)
 
 
 @dp.callback_query(F.data == "cabinet:refresh")
 async def cabinet_refresh(cb: CallbackQuery):
+    # мгновенно убираем "часики" в интерфейсе
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    chat_id = cb.message.chat.id
+
     # удаляем старое сообщение с кабинетом и присылаем новое
     try:
         await cb.message.delete()
     except Exception:
-        # если не смогли удалить — ничего страшного
         pass
 
-    await send_cabinet(cb.message, cb.from_user.id)
-    await cb.answer()  # убрать "loading"
+    await send_cabinet_to_chat(chat_id, cb.from_user.id, show_loading=True)
 
 
 # --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
-    await cb.message.delete()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
     await send_photo_safe(
         cb.message,
         PAYMENT_IMAGE_PATH,
         caption="Выберите способ оплаты",
         reply_markup=kb_payment_methods("community"),
     )
-    await cb.answer()
 
 
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
-    await cb.message.delete()
-    await send
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+    await send_photo_safe(
+        cb.message,
+        PAYMENT_IMAGE_PATH,
+        caption="Выберите способ оплаты",
+        reply_markup=kb_payment_methods("mentoring"),
+    )
+
+
+@dp.callback_query(F.data.startswith("pm:"))
+async def payment_method_choice(cb: CallbackQuery):
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    _, product_key, method = cb.data.split(":")
+
+    if product_key == "community" and method == "crypto":
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_crypto_periods())
+    elif product_key == "community" and method == "fiat":
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_fiat_periods())
+    elif product_key == "mentoring" and method == "crypto":
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_crypto())
+    elif product_key == "mentoring" and method == "fiat":
+        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_fiat())
+
+
+@dp.callback_query(F.data == "close")
+async def close_message(cb: CallbackQuery):
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+
+@dp.callback_query(F.data.startswith("sub:"))
+async def subscription_selected(cb: CallbackQuery):
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+    _, product_key, method, choice = cb.data.split(":")
+
+    # ВАЖНО: cb.from_user — это реальный пользователь
+    user_id = cb.from_user.id
+    user_username = cb.from_user.username or ""
+
+    if product_key == "community":
+        product_name = "Hadiukov Community"
+        period_key = choice if choice in ("1m", "3m") else ""
+        period_text = PERIOD_TEXT.get(period_key, "")
+        expires_at = expires_from_key(period_key) if period_key else ""
+
+        if method == "crypto":
+            amount = COMMUNITY_USDT_1M if choice == "1m" else COMMUNITY_USDT_3M
+            await send_payment_flow_final(
+                cb.message,
+                tg_id=user_id,
+                tg_username=user_username,
+                product=product_name,
+                pay_method="Crypto (USDT)",
+                currency="USDT",
+                amount=amount,
+                period_key=period_key,
+                period_text=period_text,
+                expires_at=expires_at,
+            )
+        else:
+            amount = COMMUNITY_UAH_1M if choice == "1m" else COMMUNITY_UAH_3M
+            await send_payment_flow_final(
+                cb.message,
+                tg_id=user_id,
+                tg_username=user_username,
+                product=product_name,
+                pay_method="Fiat (UAH)",
+                currency="UAH",
+                amount=amount,
+                period_key=period_key,
+                period_text=period_text,
+                expires_at=expires_at,
+            )
+
+    elif product_key == "mentoring":
+        product_name = "Hadiukov Mentoring"
+
+        if method == "crypto":
+            await send_payment_flow_final(
+                cb.message,
+                tg_id=user_id,
+                tg_username=user_username,
+                product=product_name,
+                pay_method="Crypto (USDT)",
+                currency="USDT",
+                amount=MENTORING_USDT,
+                period_key="mentoring",
+                period_text="Mentoring",
+                expires_at="",
+            )
+        else:
+            await send_payment_flow_final(
+                cb.message,
+                tg_id=user_id,
+                tg_username=user_username,
+                product=product_name,
+                pay_method="Fiat (UAH)",
+                currency="UAH",
+                amount=MENTORING_UAH,
+                period_key="mentoring",
+                period_text="Mentoring",
+                expires_at="",
+            )
+
+
+# =========================
+# RUN
+# =========================
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
