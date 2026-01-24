@@ -37,7 +37,7 @@ log = logging.getLogger("bot")
 # CONFIG / CONSTANTS
 # =========================
 
-ADMIN_USERNAME = "@name"  # поменяешь потом (жирным НЕ выделяем)
+ADMIN_USERNAME = "@trademark830am"
 
 # Resources links
 YOUTUBE_URL = "https://youtube.com/@hadiukov?si=vy9gXXiLKeDYIfR_"
