@@ -37,7 +37,7 @@ log = logging.getLogger("bot")
 # CONFIG / CONSTANTS
 # =========================
 
-ADMIN_USERNAME = "@name"  # поменяешь потом
+ADMIN_USERNAME = "@name"  # поменяешь потом (жирным НЕ выделяем)
 
 # Resources links
 YOUTUBE_URL = "https://youtube.com/@hadiukov?si=vy9gXXiLKeDYIfR_"
@@ -53,6 +53,7 @@ RESOURCES_IMAGE_PATH = "pictures/resources.png"
 PRODUCTS_IMAGE_PATH = "pictures/products.png"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
 SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
+SUPPORT_IMAGE_PATH = "pictures/support.png"  # <-- добавили
 
 # Wallet
 USDT_TRC20_ADDRESS = "TX5VC5qAprsWcnCSSdgZGXtQMFD2JjVLyK"
@@ -301,6 +302,13 @@ def mentoring_apply_kb() -> InlineKeyboardMarkup:
     ])
 
 
+def admin_contact_kb() -> InlineKeyboardMarkup:
+    admin = ADMIN_USERNAME.lstrip("@")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Написать", url=f"https://t.me/{admin}")]
+    ])
+
+
 async def send_payment_flow_final(
     message: Message,
     *,
@@ -398,7 +406,6 @@ def kb_community_buy() -> InlineKeyboardMarkup:
 
 
 def kb_mentoring_apply() -> InlineKeyboardMarkup:
-    # вместо "Приобрести" -> "Оставить заявку" и сразу в Tally
     return mentoring_apply_kb()
 
 
@@ -433,14 +440,6 @@ def cabinet_refresh_kb() -> InlineKeyboardMarkup:
     ])
 
 
-# ✅ Инлайн-кнопка для раздела "Помощь"
-def admin_contact_kb() -> InlineKeyboardMarkup:
-    admin_username = (ADMIN_USERNAME or "").lstrip("@")
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Написать", url=f"https://t.me/{admin_username}")]
-    ])
-
-
 # =========================
 # TEXTS
 # =========================
@@ -455,19 +454,21 @@ WELCOME_TEXT = (
 
 CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
 
+HELP_TEXT = (
+    "Если что-то непонятно при оформлении подписки или оплате — напишите администратору.\n"
+    "Он поможет разобраться и подскажет, что делать дальше."
+)
 
 # =========================
 # CABINET TEXT BUILDER (UPDATED)
 # =========================
 
 async def build_cabinet_text(user_id: int) -> str:
-    # дефолты
     discord = "Не указан"
     email = "Не указан"
 
     page = await get_latest_request_for_user(user_id)
     if not page:
-        # без заголовка "👤 Личный кабинет" (как ты просил)
         return (
             f"Discord: {discord}\n"
             f"Email: {email}\n\n"
@@ -477,7 +478,6 @@ async def build_cabinet_text(user_id: int) -> str:
     props = page.get("properties", {})
     st = _status_name(props, "status")
 
-    # показываем то, что пользователь оставил, для ЛЮБОГО статуса
     d = _rt_plain(props, "discord")
     e = _rt_plain(props, "email")
     if d:
@@ -488,11 +488,10 @@ async def build_cabinet_text(user_id: int) -> str:
     expires_raw = _rt_plain(props, "expires_at")
     expires_dt = _parse_expires(expires_raw)
 
-    # тексты без "Статус:"
     if st == "pending":
         status_line = "Заявка на проверке"
     elif st == "rejected":
-        status_line = f"Заявка отклонена. Свяжитесь с администратором: <b>{ADMIN_USERNAME}</b>"
+        status_line = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
     elif st == "approved":
         if expires_dt:
             if expires_dt >= date.today():
@@ -504,7 +503,6 @@ async def build_cabinet_text(user_id: int) -> str:
     else:
         status_line = "Заявка на проверке"
 
-    # без жирного для discord/email
     return (
         f"Discord: {discord}\n"
         f"Email: {email}\n\n"
@@ -513,9 +511,6 @@ async def build_cabinet_text(user_id: int) -> str:
 
 
 async def send_cabinet(message: Message, user_id: int):
-    """
-    Единая функция отправки кабинета с кнопкой "Обновить".
-    """
     try:
         t0 = time.perf_counter()
         log.info("Cabinet tapped. user_id=%s", user_id)
@@ -567,16 +562,15 @@ async def info_from_menu(message: Message):
 Если тебе близка торговля как работа, а не как азарт – добро пожаловать в Hadiukov Community.""")
 
 
-# ✅ UPDATED: помощь + инлайн "Написать" + замена плитки на "В главное меню"
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
-    help_text = (
-        "Если что-то непонятно при оформлении подписки или оплате – просто напишите администратору, "
-        "он поможет разобраться и подскажет, что делать дальше."
+    # 1) Фото + подпись (caption) + inline кнопка "Написать"
+    await send_photo_safe(
+        message,
+        SUPPORT_IMAGE_PATH,
+        caption=HELP_TEXT,
+        reply_markup=admin_contact_kb(),
     )
-
-    # 1) Текст + инлайн кнопка
-    await safe_answer(message, help_text, reply_markup=admin_contact_kb())
 
     # 2) Меняем нижнюю клавиатуру на одну кнопку "В главное меню"
     await safe_answer(
@@ -628,7 +622,6 @@ async def community_info(message: Message):
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
-    # текст как сейчас + вместо "Приобрести" -> "Оставить заявку" и сразу в Tally
     await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
 
 
@@ -648,7 +641,6 @@ async def cabinet_refresh(cb: CallbackQuery):
     await safe_cb_answer(cb)
 
 
-# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     try:
@@ -665,7 +657,6 @@ async def buy_community(cb: CallbackQuery):
     await safe_cb_answer(cb)
 
 
-# На всякий случай: если где-то остались старые сообщения с callback buy:mentoring — не ломаемся.
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring_legacy(cb: CallbackQuery):
     try:
@@ -681,7 +672,6 @@ async def buy_mentoring_legacy(cb: CallbackQuery):
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
 
-    # mentoring больше НЕ проходит через оплату/сроки
     if product_key == "mentoring":
         await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
         await safe_cb_answer(cb)
@@ -711,7 +701,6 @@ async def subscription_selected(cb: CallbackQuery):
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
-    # mentoring больше НЕ проходит через оплату/сроки
     if product_key == "mentoring":
         await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
         await safe_cb_answer(cb)
