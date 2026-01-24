@@ -194,7 +194,6 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10, max_attem
             await asyncio.sleep(sleep_s)
         except httpx.HTTPStatusError as e:
             last_err = e
-            # другие статус-коды не ретраим (обычно ошибка запроса)
             log.error("Notion query HTTPStatusError: %s", str(e))
             raise
         except Exception as e:
@@ -434,6 +433,14 @@ def cabinet_refresh_kb() -> InlineKeyboardMarkup:
     ])
 
 
+# ✅ Инлайн-кнопка для раздела "Помощь"
+def admin_contact_kb() -> InlineKeyboardMarkup:
+    admin_username = (ADMIN_USERNAME or "").lstrip("@")
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Написать", url=f"https://t.me/{admin_username}")]
+    ])
+
+
 # =========================
 # TEXTS
 # =========================
@@ -560,9 +567,23 @@ async def info_from_menu(message: Message):
 Если тебе близка торговля как работа, а не как азарт – добро пожаловать в Hadiukov Community.""")
 
 
+# ✅ UPDATED: помощь + инлайн "Написать" + замена плитки на "В главное меню"
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
-    await safe_answer(message, "❓ Раздел «Помощь» пока в разработке.")
+    help_text = (
+        "Если что-то непонятно при оформлении подписки или оплате – просто напишите администратору, "
+        "он поможет разобраться и подскажет, что делать дальше."
+    )
+
+    # 1) Текст + инлайн кнопка
+    await safe_answer(message, help_text, reply_markup=admin_contact_kb())
+
+    # 2) Меняем нижнюю клавиатуру на одну кнопку "В главное меню"
+    await safe_answer(
+        message,
+        "Чтобы вернуться, нажмите «В главное меню».",
+        reply_markup=resources_back_kb(),
+    )
 
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
@@ -587,7 +608,7 @@ async def community_info(message: Message):
     await send_photo_safe(
         message,
         COMMUNITY_IMAGE_PATH,
-        caption= """Я ежедневно выполняю свою рутину – торговые планы, аналитика, статистика, сделки.
+        caption="""Я ежедневно выполняю свою рутину – торговые планы, аналитика, статистика, сделки.
 В Discord я просто делюсь этим процессом в реальном времени, без задержек и в спокойной обстановке.
 
 Это не обучение и не “инфо-помойка”. Нет десятков веток, методичек и бесконечных уроков. Сервер собран только под практику. Я показываю, как сам работаю.
@@ -603,7 +624,6 @@ async def community_info(message: Message):
 Суть сервера – выстроить рабочий алгоритм и быть в адекватной среде, где все нацелены на результат и процесс.""",
         reply_markup=kb_community_buy(),
     )
-
 
 
 @dp.message(F.text == "Hadiukov Mentoring")
