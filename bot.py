@@ -1,8 +1,8 @@
 import uuid
 import asyncio
-import logging
-import random
 import time
+import random
+import logging
 from datetime import datetime, date
 from urllib.parse import urlencode, quote
 
@@ -28,7 +28,6 @@ from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 # =========================
 # LOGGING
 # =========================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -67,16 +66,6 @@ MENTORING_UAH = 130000
 PERIOD_TEXT = {"1m": "1 month", "3m": "3 months"}
 PERIOD_MONTHS = {"1m": 1, "3m": 3}
 
-WELCOME_TEXT = (
-    "Вас приветствует Sever by Hadiukov!\n\n"
-    "Сейчас вы находитесь в официальном боте проекта.\n"
-    "Здесь вы можете оформить или продлить подписку и отправить подтверждение оплаты.\n\n"
-    "Выберите нужный раздел в меню снизу 👇\n"
-    f"Если возникнут вопросы — напишите администратору {ADMIN_USERNAME}."
-)
-
-CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
-
 # =========================
 # BOT INIT
 # =========================
@@ -91,59 +80,45 @@ dp = Dispatcher()
 async def safe_answer(message: Message, text: str, *, reply_markup=None, retries: int = 2):
     """
     Надёжная отправка сообщений: если Telegram временно не отвечает, пробуем ещё раз.
-    Если совсем плохо — просто не валим процесс.
+    Если совсем плохо — просто молча не падаем.
     """
-    last_err = None
     for attempt in range(1, retries + 1):
         try:
             return await message.answer(text, reply_markup=reply_markup)
         except TelegramNetworkError as e:
-            last_err = e
-            log.warning(
-                "TelegramNetworkError on answer (attempt %s/%s). chat_id=%s user_id=%s err=%s",
-                attempt, retries, getattr(message.chat, "id", None),
-                getattr(message.from_user, "id", None),
-                repr(e),
-            )
+            log.warning(f"TelegramNetworkError on answer (attempt {attempt}/{retries}): {e}")
             await asyncio.sleep(1.0)
-        except Exception as e:
-            # Любая другая ошибка отправки
-            log.exception(
-                "Unexpected error on message.answer. chat_id=%s user_id=%s err=%s",
-                getattr(message.chat, "id", None),
-                getattr(message.from_user, "id", None),
-                repr(e),
-            )
-            return None
+    return None  # не валим процесс
 
-    # не валим процесс, но логируем финальную ошибку
-    if last_err:
-        log.error(
-            "Failed to send message after retries. chat_id=%s user_id=%s last_err=%s",
-            getattr(message.chat, "id", None),
-            getattr(message.from_user, "id", None),
-            repr(last_err),
-        )
-    return None
 
 # =========================
-# NOTION (READ ONLY) + RETRIES/BACKOFF
+# NOTION (READ ONLY) + RETRY / BACKOFF
 # =========================
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-# Таймауты и ретраи для Notion
-NOTION_TIMEOUT = httpx.Timeout(connect=10.0, read=20.0, write=20.0, pool=20.0)
-NOTION_RETRIES = 4
+# Настройки ретраев на Notion
+NOTION_MAX_ATTEMPTS = 4                 # 1..4
+NOTION_BASE_DELAY = 0.6                 # стартовая пауза (сек)
+NOTION_MAX_DELAY = 6.0                  # максимум паузы (сек)
+NOTION_TIMEOUT = 60                     # таймаут запроса (сек)
+
+
+def _backoff_delay(attempt: int) -> float:
+    """
+    attempt: 1..N
+    Экспоненциальная задержка + джиттер.
+    """
+    exp = NOTION_BASE_DELAY * (2 ** (attempt - 1))
+    jitter = random.uniform(0.0, 0.25)
+    return min(NOTION_MAX_DELAY, exp + jitter)
 
 
 async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
     """
-    Query Notion DB с ретраями/backoff + логами времени.
-    Ретраим:
-      - timeout/transport errors
-      - 429, 502, 503, 504
+    Query Notion DB с ретраями/backoff.
+    Ретраим: Timeout/Connect/ReadError + HTTP 429 + HTTP 5xx
     """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
@@ -158,50 +133,60 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
     }
 
     last_exc = None
+    started = time.perf_counter()
 
-    for attempt in range(1, NOTION_RETRIES + 1):
+    for attempt in range(1, NOTION_MAX_ATTEMPTS + 1):
         t0 = time.perf_counter()
         try:
+            log.info(f"Notion query start (attempt {attempt}/{NOTION_MAX_ATTEMPTS})")
             async with httpx.AsyncClient(timeout=NOTION_TIMEOUT) as client:
                 r = await client.post(url, headers=headers, json=payload)
 
-            # временные статусы — ретраим
-            if r.status_code in (429, 502, 503, 504):
-                raise httpx.HTTPStatusError(
-                    f"Notion temporary error: {r.status_code}",
-                    request=r.request,
-                    response=r,
-                )
+            # Обработка rate limit / временных ошибок
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                wait = float(retry_after) if retry_after and retry_after.isdigit() else _backoff_delay(attempt)
+                log.warning(f"Notion 429 Too Many Requests. Wait {wait:.2f}s and retry...")
+                await asyncio.sleep(wait)
+                continue
+
+            if 500 <= r.status_code < 600:
+                wait = _backoff_delay(attempt)
+                log.warning(f"Notion {r.status_code} server error. Wait {wait:.2f}s and retry...")
+                await asyncio.sleep(wait)
+                continue
 
             r.raise_for_status()
-            ms = int((time.perf_counter() - t0) * 1000)
-            log.info("Notion query OK (%sms) attempt=%s/%s", ms, attempt, NOTION_RETRIES)
+
+            dt_ms = (time.perf_counter() - t0) * 1000
+            total_ms = (time.perf_counter() - started) * 1000
+            log.info(f"Notion query OK ({dt_ms:.1f}ms). Total {total_ms:.1f}ms.")
             return r.json()
 
-        except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as e:
+        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
             last_exc = e
-            ms = int((time.perf_counter() - t0) * 1000)
-            log.warning(
-                "Notion query FAIL (%sms) attempt=%s/%s err=%s",
-                ms, attempt, NOTION_RETRIES, repr(e),
-            )
+            wait = _backoff_delay(attempt)
+            log.warning(f"Notion network/timeout error: {e}. Wait {wait:.2f}s (attempt {attempt}/{NOTION_MAX_ATTEMPTS})")
+            await asyncio.sleep(wait)
+            continue
 
-            if attempt < NOTION_RETRIES:
-                # backoff: 1,2,4,... + jitter
-                delay = (2 ** (attempt - 1)) + random.uniform(0.0, 0.35)
-                log.info("Notion retrying after %.2fs", delay)
-                await asyncio.sleep(delay)
-            else:
-                log.error("Notion query окончательно упал после ретраев: %s", repr(e))
-                raise
-
-        except Exception as e:
-            # не ретраим неизвестные ошибки, но логируем
-            log.exception("Notion query unexpected error: %s", repr(e))
+        except httpx.HTTPStatusError as e:
+            # 4xx кроме 429 — обычно это не "временно", ретраить бессмысленно
+            last_exc = e
+            status = e.response.status_code if e.response else "unknown"
+            log.error(f"Notion HTTPStatusError (status={status}): {e}")
             raise
 
-    # теоретически недостижимо
-    raise last_exc or RuntimeError("Notion query failed")
+        except Exception as e:
+            last_exc = e
+            log.exception(f"Notion unexpected error: {e}")
+            raise
+
+    # Если дошли сюда — все попытки исчерпаны
+    total_ms = (time.perf_counter() - started) * 1000
+    log.error(f"Notion query FAILED after {NOTION_MAX_ATTEMPTS} attempts. Total {total_ms:.1f}ms. Last={last_exc}")
+    # Пробрасываем как таймаут, чтобы в кабинете показать CABINET_RETRY_TEXT
+    raise httpx.TimeoutException(f"Notion request failed after retries: {last_exc}")
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
@@ -257,13 +242,10 @@ async def get_latest_request_for_user(tg_id: int) -> dict | None:
     """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
-
-    log.info("Cabinet Notion fetch start. tg_id=%s", tg_id_str)
     data = await notion_query_database(filter_obj, page_size=10)
     results = data.get("results", [])
-    page = results[0] if results else None
-    log.info("Cabinet Notion fetch done. tg_id=%s found=%s", tg_id_str, bool(page))
-    return page
+    return results[0] if results else None
+
 
 # =========================
 # HELPERS
@@ -286,16 +268,10 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
     except TelegramNetworkError as e:
-        log.warning(
-            "TelegramNetworkError on answer_photo. path=%s chat_id=%s user_id=%s err=%s",
-            path, getattr(message.chat, "id", None), getattr(message.from_user, "id", None), repr(e),
-        )
+        log.warning(f"TelegramNetworkError on send_photo: {e}")
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
     except Exception as e:
-        log.warning(
-            "answer_photo failed, fallback to text. path=%s err=%s",
-            path, repr(e),
-        )
+        log.warning(f"send_photo_safe error: {e}")
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
 
 
@@ -341,17 +317,13 @@ async def send_payment_flow_final(
     tally_url = build_tally_url(params)
     kb = tally_confirm_kb(tally_url)
 
-    log.info(
-        "Payment flow init. tg_id=%s product=%s pay_method=%s currency=%s amount=%s period_key=%s",
-        tg_id, product, pay_method, currency, amount, period_key,
-    )
-
     if currency == "USDT":
         await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} USDT:")
         await safe_answer(message, f"<code>{USDT_TRC20_ADDRESS}</code> (USDT. Сеть TRC20)", reply_markup=kb)
     else:
         await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
         await safe_answer(message, "Скоро добавим карту.", reply_markup=kb)
+
 
 # =========================
 # KEYBOARDS
@@ -455,6 +427,22 @@ def cabinet_refresh_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Обновить", callback_data="cabinet:refresh")]
     ])
 
+
+# =========================
+# TEXTS
+# =========================
+
+WELCOME_TEXT = (
+    "Вас приветствует Sever by Hadiukov!\n\n"
+    "Сейчас вы находитесь в официальном боте проекта.\n"
+    "Здесь вы можете оформить или продлить подписку и отправить подтверждение оплаты.\n\n"
+    "Выберите нужный раздел в меню снизу 👇\n"
+    f"Если возникнут вопросы — напишите администратору {ADMIN_USERNAME}."
+)
+
+CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
+
+
 # =========================
 # CABINET TEXT BUILDER
 # =========================
@@ -505,20 +493,22 @@ async def send_cabinet(message: Message, user_id: int):
     """
     Единая функция отправки кабинета с кнопкой "Обновить".
     """
+    log.info(f"Cabinet tapped. user_id={user_id}")
+    t0 = time.perf_counter()
     try:
-        t0 = time.perf_counter()
         text = await build_cabinet_text(user_id)
-        ms = int((time.perf_counter() - t0) * 1000)
-        log.info("Cabinet build OK (%sms). user_id=%s", ms, user_id)
         await safe_answer(message, text, reply_markup=cabinet_refresh_kb())
-
+        dt_ms = (time.perf_counter() - t0) * 1000
+        log.info(f"Cabinet build OK ({dt_ms:.1f}ms). user_id={user_id}")
     except (httpx.TimeoutException, TelegramNetworkError) as e:
-        log.warning("Cabinet temporary error. user_id=%s err=%s", user_id, repr(e))
+        dt_ms = (time.perf_counter() - t0) * 1000
+        log.warning(f"Cabinet failed (timeout/telegram) ({dt_ms:.1f}ms). user_id={user_id}. err={e}")
         await safe_answer(message, CABINET_RETRY_TEXT)
-
     except Exception as e:
-        log.exception("Cabinet unexpected error. user_id=%s err=%s", user_id, repr(e))
+        dt_ms = (time.perf_counter() - t0) * 1000
+        log.exception(f"Cabinet unexpected error ({dt_ms:.1f}ms). user_id={user_id}. err={e}")
         await safe_answer(message, f"Ошибка кабинета: {e}")
+
 
 # =========================
 # HANDLERS
@@ -526,37 +516,31 @@ async def send_cabinet(message: Message, user_id: int):
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    log.info("START /start. user_id=%s username=%s", message.from_user.id, message.from_user.username)
     await safe_answer(message, WELCOME_TEXT, reply_markup=main_menu_kb())
 
 
 @dp.message(Command("menu"))
 async def menu(message: Message):
-    log.info("CMD /menu. user_id=%s", message.from_user.id)
     await safe_answer(message, "Главное меню 👇", reply_markup=main_menu_kb())
 
 
 @dp.message(lambda m: (m.text or "") == "В главное меню")
 async def back_to_main_menu(message: Message):
-    log.info("Back to main menu. user_id=%s", message.from_user.id)
     await safe_answer(message, "Главное меню", reply_markup=main_menu_kb())
 
 
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
-    log.info("Info tapped. user_id=%s", message.from_user.id)
     await safe_answer(message, "ℹ️ Раздел «Информация» пока в разработке.")
 
 
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
-    log.info("Help tapped. user_id=%s", message.from_user.id)
     await safe_answer(message, "❓ Раздел «Помощь» пока в разработке.")
 
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
 async def resources_from_menu(message: Message):
-    log.info("Resources tapped. user_id=%s", message.from_user.id)
     await send_photo_safe(
         message,
         RESOURCES_IMAGE_PATH,
@@ -568,45 +552,43 @@ async def resources_from_menu(message: Message):
 
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
 async def products_entry(message: Message):
-    log.info("Products tapped. user_id=%s", message.from_user.id)
     await send_photo_safe(message, PRODUCTS_IMAGE_PATH, caption=None)
     await safe_answer(message, "Выберите:", reply_markup=products_menu_kb())
 
 
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
-    log.info("Product: Community. user_id=%s", message.from_user.id)
     await safe_answer(message, "Объяснение внутрянки сервера", reply_markup=kb_community_buy())
 
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
-    log.info("Product: Mentoring. user_id=%s", message.from_user.id)
     await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
 
 
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    log.info("Cabinet tapped. user_id=%s", message.from_user.id)
     await send_cabinet(message, message.from_user.id)
 
 
 @dp.callback_query(F.data == "cabinet:refresh")
 async def cabinet_refresh(cb: CallbackQuery):
-    log.info("Cabinet refresh tapped. user_id=%s", cb.from_user.id)
+    user_id = cb.from_user.id
+    log.info(f"Cabinet refresh clicked. user_id={user_id}")
+
+    # удаляем старое сообщение с кабинетом и присылаем новое
     try:
         await cb.message.delete()
     except Exception as e:
-        log.warning("Cabinet refresh: failed to delete old message. err=%s", repr(e))
+        log.warning(f"Cabinet refresh: failed to delete message: {e}")
 
-    await send_cabinet(cb.message, cb.from_user.id)
-    await cb.answer()
+    await send_cabinet(cb.message, user_id)
+    await cb.answer()  # убрать "loading"
 
 
 # --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
-    log.info("Buy community. user_id=%s", cb.from_user.id)
     await cb.message.delete()
     await send_photo_safe(
         cb.message,
@@ -619,7 +601,6 @@ async def buy_community(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
-    log.info("Buy mentoring. user_id=%s", cb.from_user.id)
     await cb.message.delete()
     await send_photo_safe(
         cb.message,
@@ -633,7 +614,6 @@ async def buy_mentoring(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
-    log.info("Payment method choice. user_id=%s product=%s method=%s", cb.from_user.id, product_key, method)
 
     if product_key == "community" and method == "crypto":
         await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_crypto_periods())
@@ -649,7 +629,6 @@ async def payment_method_choice(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "close")
 async def close_message(cb: CallbackQuery):
-    log.info("Close message. user_id=%s", cb.from_user.id)
     await cb.message.delete()
     await cb.answer()
 
@@ -658,10 +637,9 @@ async def close_message(cb: CallbackQuery):
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
+    # ВАЖНО: cb.from_user — это реальный пользователь
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
-
-    log.info("Subscription selected. user_id=%s product=%s method=%s choice=%s", user_id, product_key, method, choice)
 
     if product_key == "community":
         product_name = "Hadiukov Community"
@@ -729,6 +707,7 @@ async def subscription_selected(cb: CallbackQuery):
             )
 
     await cb.answer()
+
 
 # =========================
 # RUN
