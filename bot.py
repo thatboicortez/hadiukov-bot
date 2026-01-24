@@ -2,7 +2,6 @@ import uuid
 import asyncio
 from datetime import datetime, date
 from urllib.parse import urlencode, quote
-from typing import Optional, Dict, Tuple
 
 import httpx
 from dateutil.relativedelta import relativedelta
@@ -63,57 +62,33 @@ bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # =========================
-# HTTP CLIENT (GLOBAL, KEEP-ALIVE)
-# =========================
-
-_http: Optional[httpx.AsyncClient] = None
-
-def get_http() -> httpx.AsyncClient:
-    global _http
-    if _http is None:
-        # Быстрые таймауты для “живости” + keep-alive пул
-        timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
-        limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
-        _http = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False, follow_redirects=True)
-    return _http
-
-
-async def on_shutdown():
-    global _http
-    if _http is not None:
-        await _http.aclose()
-        _http = None
-
-dp.shutdown.register(on_shutdown)
-
-# =========================
 # SAFE SEND (Telegram retry)
 # =========================
 
 async def safe_answer(message: Message, text: str, *, reply_markup=None, retries: int = 2):
+    """
+    Надёжная отправка сообщений: если Telegram временно не отвечает, пробуем ещё раз.
+    Если совсем плохо — просто молча не падаем.
+    """
     for _ in range(retries):
         try:
             return await message.answer(text, reply_markup=reply_markup)
         except TelegramNetworkError:
-            await asyncio.sleep(0.7)
-    return None
+            await asyncio.sleep(1.0)
+    return None  # не валим процесс
 
 
 async def safe_send(chat_id: int, text: str, *, reply_markup=None, retries: int = 2):
+    """
+    Надёжная отправка напрямую через bot.send_message по chat_id.
+    Полезно, когда исходное сообщение уже удалили (например при refresh).
+    """
     for _ in range(retries):
         try:
             return await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
         except TelegramNetworkError:
-            await asyncio.sleep(0.7)
+            await asyncio.sleep(1.0)
     return None
-
-
-async def safe_edit_text(message: Message, text: str, *, reply_markup=None):
-    try:
-        return await message.edit_text(text, reply_markup=reply_markup)
-    except Exception:
-        # если нельзя edit (например, сообщение уже не твоё/старое) — просто отправим новое
-        return await safe_send(message.chat.id, text, reply_markup=reply_markup)
 
 
 # =========================
@@ -124,33 +99,32 @@ NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 
-def notion_headers() -> dict:
-    return {
+async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
+    """
+    Query Notion DB. Таймаут больше, чтобы реже ловить random timeout.
+    """
+    url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
+    headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Notion-Version": NOTION_VERSION,
         "Content-Type": "application/json",
     }
-
-
-async def notion_query_database(filter_obj: dict, page_size: int = 1) -> dict:
-    """
-    Query Notion DB with shared http client (keep-alive).
-    page_size=1 потому что ты берёшь только последнюю запись.
-    """
-    url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     payload = {
         "filter": filter_obj,
         "page_size": page_size,
         "sorts": [{"timestamp": "created_time", "direction": "descending"}],
     }
 
-    client = get_http()
-    r = await client.post(url, headers=notion_headers(), json=payload)
-    r.raise_for_status()
-    return r.json()
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        return r.json()
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
+    """
+    Читает Notion Text (rich_text) как строку.
+    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -163,6 +137,10 @@ def _rt_plain(props: dict, prop_name: str) -> str:
 
 
 def _status_name(props: dict, prop_name: str = "status") -> str:
+    """
+    Читает Notion Status как name.
+    Если вдруг сделаешь status обычным Text — тоже отработает (через rich_text).
+    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -178,7 +156,10 @@ def _status_name(props: dict, prop_name: str = "status") -> str:
     return ""
 
 
-def _parse_expires(expires_at_str: str) -> Optional[date]:
+def _parse_expires(expires_at_str: str) -> date | None:
+    """
+    expires_at хранится как TEXT 'YYYY-MM-DD'
+    """
     if not expires_at_str:
         return None
     try:
@@ -187,10 +168,13 @@ def _parse_expires(expires_at_str: str) -> Optional[date]:
         return None
 
 
-async def get_latest_request_for_user(tg_id: int) -> Optional[dict]:
+async def get_latest_request_for_user(tg_id: int) -> dict | None:
+    """
+    Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса).
+    """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
-    data = await notion_query_database(filter_obj, page_size=1)
+    data = await notion_query_database(filter_obj, page_size=10)
     results = data.get("results", [])
     return results[0] if results else None
 
@@ -211,8 +195,7 @@ def build_tally_url(params: dict) -> str:
     return f"{TALLY_FORM_URL}?{query}"
 
 
-# Файлы можно держать как path — FSInputFile лёгкий, создаём при отправке.
-async def send_photo_safe(message: Message, path: str, caption: Optional[str] = None, reply_markup=None):
+async def send_photo_safe(message: Message, path: str, caption: str | None = None, reply_markup=None):
     try:
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
@@ -392,20 +375,8 @@ CABINET_LOADING_TEXT = "⏳ Загружаю личный кабинет..."
 
 
 # =========================
-# CABINET FAST: CACHE + LOCK + BACKGROUND UPDATE
+# CABINET TEXT BUILDER
 # =========================
-
-# cache: user_id -> (timestamp_monotonic, text)
-_cabinet_cache: Dict[int, Tuple[float, str]] = {}
-_user_locks: Dict[int, asyncio.Lock] = {}
-
-def _lock_for(user_id: int) -> asyncio.Lock:
-    lock = _user_locks.get(user_id)
-    if lock is None:
-        lock = asyncio.Lock()
-        _user_locks[user_id] = lock
-    return lock
-
 
 async def build_cabinet_text(user_id: int) -> str:
     discord = "Не указан"
@@ -449,40 +420,28 @@ async def build_cabinet_text(user_id: int) -> str:
     )
 
 
-async def update_cabinet_message(message: Message, user_id: int, *, force: bool = False):
+async def send_cabinet_to_chat(chat_id: int, user_id: int, *, show_loading: bool = True):
     """
-    Обновляет ОДНО сообщение: сначала "loading", потом edit на реальный текст.
-    Делается под lock, с кэшем на 3 секунды.
+    Единая функция отправки кабинета с кнопкой "Обновить".
+    Делает быстрый "отклик" (loading) и потом удаляет его.
     """
-    async with _lock_for(user_id):
-        now = asyncio.get_running_loop().time()
+    loading_msg = None
+    if show_loading:
+        loading_msg = await safe_send(chat_id, CABINET_LOADING_TEXT)
 
-        if not force:
-            cached = _cabinet_cache.get(user_id)
-            if cached and (now - cached[0] <= 3.0):
-                await safe_edit_text(message, cached[1], reply_markup=cabinet_refresh_kb())
-                return
-
-        # показываем loading (и не ждём Notion в UI)
-        await safe_edit_text(message, CABINET_LOADING_TEXT, reply_markup=cabinet_refresh_kb())
-
-        try:
-            text = await build_cabinet_text(user_id)
-            _cabinet_cache[user_id] = (now, text)
-            await safe_edit_text(message, text, reply_markup=cabinet_refresh_kb())
-        except (httpx.TimeoutException, TelegramNetworkError):
-            await safe_edit_text(message, CABINET_RETRY_TEXT, reply_markup=cabinet_refresh_kb())
-        except Exception as e:
-            await safe_edit_text(message, f"Ошибка кабинета: {e}", reply_markup=cabinet_refresh_kb())
-
-
-def run_bg(coro):
-    async def _runner():
-        try:
-            await coro
-        except Exception:
-            pass
-    asyncio.create_task(_runner())
+    try:
+        text = await build_cabinet_text(user_id)
+        await safe_send(chat_id, text, reply_markup=cabinet_refresh_kb())
+    except (httpx.TimeoutException, TelegramNetworkError):
+        await safe_send(chat_id, CABINET_RETRY_TEXT)
+    except Exception as e:
+        await safe_send(chat_id, f"Ошибка кабинета: {e}")
+    finally:
+        if loading_msg:
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=loading_msg.message_id)
+            except Exception:
+                pass
 
 
 # =========================
@@ -543,26 +502,35 @@ async def mentoring_info(message: Message):
 
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
 async def cabinet_from_menu(message: Message):
-    # мгновенно отдаём сообщение, а Notion грузим в фоне и редактируем это же сообщение
-    m = await safe_answer(message, CABINET_LOADING_TEXT, reply_markup=cabinet_refresh_kb())
-    if m:
-        run_bg(update_cabinet_message(m, message.from_user.id, force=True))
+    await send_cabinet_to_chat(message.chat.id, message.from_user.id, show_loading=True)
 
 
 @dp.callback_query(F.data == "cabinet:refresh")
 async def cabinet_refresh(cb: CallbackQuery):
-    # ✅ ВАЖНО: ack в первой строке, без try/except
-    await cb.answer()
+    # мгновенно убираем "часики" в интерфейсе
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
-    if cb.message:
-        # мгновенно: просто запускаем обновление в фоне
-        run_bg(update_cabinet_message(cb.message, cb.from_user.id, force=True))
+    chat_id = cb.message.chat.id
+
+    # удаляем старое сообщение с кабинетом и присылаем новое
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+    await send_cabinet_to_chat(chat_id, cb.from_user.id, show_loading=True)
 
 
 # --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
     try:
         await cb.message.delete()
@@ -579,7 +547,10 @@ async def buy_community(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring(cb: CallbackQuery):
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
     try:
         await cb.message.delete()
@@ -596,7 +567,10 @@ async def buy_mentoring(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
     _, product_key, method = cb.data.split(":")
 
@@ -612,7 +586,11 @@ async def payment_method_choice(cb: CallbackQuery):
 
 @dp.callback_query(F.data == "close")
 async def close_message(cb: CallbackQuery):
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
     try:
         await cb.message.delete()
     except Exception:
@@ -621,10 +599,14 @@ async def close_message(cb: CallbackQuery):
 
 @dp.callback_query(F.data.startswith("sub:"))
 async def subscription_selected(cb: CallbackQuery):
-    await cb.answer()
+    try:
+        await cb.answer()
+    except Exception:
+        pass
 
     _, product_key, method, choice = cb.data.split(":")
 
+    # ВАЖНО: cb.from_user — это реальный пользователь
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
@@ -699,8 +681,6 @@ async def subscription_selected(cb: CallbackQuery):
 # =========================
 
 async def main():
-    # прогреем клиент (опционально, но часто ускоряет первый Notion-запрос)
-    get_http()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
