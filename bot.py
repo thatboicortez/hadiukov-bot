@@ -74,7 +74,7 @@ def get_http() -> httpx.AsyncClient:
         # Быстрые таймауты для “живости” + keep-alive пул
         timeout = httpx.Timeout(connect=5.0, read=20.0, write=10.0, pool=5.0)
         limits = httpx.Limits(max_connections=50, max_keepalive_connections=20, keepalive_expiry=30.0)
-        _http = httpx.AsyncClient(timeout=timeout, limits=limits, http2=True, follow_redirects=True)
+        _http = httpx.AsyncClient(timeout=timeout, limits=limits, http2=False, follow_redirects=True)
     return _http
 
 
