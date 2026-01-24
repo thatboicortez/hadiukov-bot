@@ -1,7 +1,6 @@
 import uuid
 import asyncio
 import logging
-import random
 import time
 from datetime import datetime, date
 from urllib.parse import urlencode, quote
@@ -21,15 +20,13 @@ from aiogram.types import (
     KeyboardButton,
     FSInputFile,
 )
-from aiogram.exceptions import TelegramNetworkError
-from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 
 from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
 # =========================
 # LOGGING
 # =========================
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -46,6 +43,9 @@ ADMIN_USERNAME = "@name"  # поменяешь потом
 YOUTUBE_URL = "https://youtube.com/@hadiukov?si=vy9gXXiLKeDYIfR_"
 INSTAGRAM_URL = "https://www.instagram.com/hadiukov?igsh=MTdtZmp4MmtxdzF2dw=="
 TELEGRAM_URL = "https://t.me/hadiukov"
+
+# Mentoring Tally (заявка)
+MENTORING_TALLY_URL = "https://tally.so/r/68KqNN"
 
 # Images (пути в репо)
 RESOURCES_IMAGE_PATH = "pictures/resources.png"
@@ -68,53 +68,80 @@ MENTORING_UAH = 130000
 PERIOD_TEXT = {"1m": "1 month", "3m": "3 months"}
 PERIOD_MONTHS = {"1m": 1, "3m": 3}
 
-CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
-
 # =========================
 # BOT INIT
 # =========================
 
-# ✅ убираем warning про parse_mode и делаем по-правильному
-bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
+bot = Bot(BOT_TOKEN, parse_mode="HTML")
 dp = Dispatcher()
 
 # =========================
 # SAFE SEND (Telegram retry)
 # =========================
 
-async def safe_answer(message: Message, text: str, *, reply_markup=None, retries: int = 2):
+async def safe_answer(message: Message, text: str, *, reply_markup=None, retries: int = 3):
     """
-    Надёжная отправка сообщений: если Telegram временно не отвечает, пробуем ещё раз.
-    Если совсем плохо — просто молча не падаем.
+    Надёжная отправка сообщений:
+    - TelegramNetworkError: повторяем
+    - TelegramRetryAfter (Flood control): ждём и повторяем
     """
+    last_err = None
     for attempt in range(retries):
         try:
             return await message.answer(text, reply_markup=reply_markup)
+        except TelegramRetryAfter as e:
+            last_err = e
+            wait_s = float(getattr(e, "retry_after", 2.0))
+            log.warning("TelegramRetryAfter: wait %.2fs (attempt %s/%s)", wait_s, attempt + 1, retries)
+            await asyncio.sleep(wait_s)
         except TelegramNetworkError as e:
-            log.warning(f"TelegramNetworkError on answer (attempt {attempt+1}/{retries}): {e}")
-            await asyncio.sleep(1.0)
+            last_err = e
+            await asyncio.sleep(1.0 + attempt * 0.5)
         except Exception as e:
-            log.exception(f"Unexpected error in safe_answer: {e}")
-            return None
-    return None  # не валим процесс
+            last_err = e
+            break
+    log.error("safe_answer failed: %r", last_err)
+    return None
+
+
+async def safe_cb_answer(cb: CallbackQuery, *, retries: int = 3):
+    """
+    Чтобы всегда гасить 'loading...' на инлайн кнопках.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            await cb.answer()
+            return
+        except TelegramRetryAfter as e:
+            last_err = e
+            wait_s = float(getattr(e, "retry_after", 2.0))
+            log.warning("cb.answer TelegramRetryAfter: wait %.2fs (attempt %s/%s)", wait_s, attempt + 1, retries)
+            await asyncio.sleep(wait_s)
+        except TelegramNetworkError as e:
+            last_err = e
+            await asyncio.sleep(1.0 + attempt * 0.5)
+        except Exception as e:
+            last_err = e
+            break
+    log.error("safe_cb_answer failed: %r", last_err)
 
 
 # =========================
-# NOTION (READ ONLY) + RETRIES/BACKOFF
+# NOTION (READ ONLY)
 # =========================
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
 
-def _should_retry_notion(status_code: int) -> bool:
-    # 429 = rate limit, 5xx = временные сбои
-    return status_code in (429, 500, 502, 503, 504)
-
-
-async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
+async def notion_query_database(filter_obj: dict, page_size: int = 10, max_attempts: int = 4) -> dict:
     """
-    Query Notion DB с ретраями + экспоненциальным backoff + jitter.
+    Query Notion DB с ретраями + backoff.
+    Ретраим:
+      - timeout / transport errors
+      - 429 (rate limit)
+      - 5xx
     """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
@@ -128,67 +155,54 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
         "sorts": [{"timestamp": "created_time", "direction": "descending"}],
     }
 
-    max_attempts = 4
-    base_delay = 0.7  # сек
-    timeout = httpx.Timeout(60.0)
+    base_delay = 0.7
+    timeout = httpx.Timeout(30.0, connect=10.0)
 
-    last_exc = None
-
+    last_err = None
     for attempt in range(1, max_attempts + 1):
         t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(url, headers=headers, json=payload)
 
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            log.info(f"Notion query attempt={attempt}/{max_attempts} status={r.status_code} time={elapsed_ms}ms")
+            dt_ms = int((time.perf_counter() - t0) * 1000)
 
-            if r.status_code >= 400:
-                # если это "временная" ошибка — ретраим
-                if _should_retry_notion(r.status_code) and attempt < max_attempts:
-                    # если Notion прислал Retry-After — уважаем, но всё равно добавим чуть jitter
-                    retry_after = r.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            delay = float(retry_after)
-                        except Exception:
-                            delay = base_delay * (2 ** (attempt - 1))
-                    else:
-                        delay = base_delay * (2 ** (attempt - 1))
+            # ретраи на 429 / 5xx
+            if r.status_code == 429 or 500 <= r.status_code <= 599:
+                retry_after = r.headers.get("Retry-After")
+                if retry_after:
+                    sleep_s = float(retry_after)
+                else:
+                    sleep_s = base_delay * (2 ** (attempt - 1))
+                log.warning(
+                    "Notion query retryable status=%s (%sms) attempt=%s/%s sleep=%.2fs",
+                    r.status_code, dt_ms, attempt, max_attempts, sleep_s
+                )
+                await asyncio.sleep(sleep_s)
+                continue
 
-                    delay = min(delay, 8.0) + random.uniform(0.0, 0.35)
-                    log.warning(f"Notion retryable status={r.status_code}, sleeping {delay:.2f}s")
-                    await asyncio.sleep(delay)
-                    continue
+            r.raise_for_status()
 
-                # иначе — бросаем как есть
-                r.raise_for_status()
-
+            log.info("Notion query OK (%sms) attempt=%s/%s", dt_ms, attempt, max_attempts)
             return r.json()
 
-        except (httpx.TimeoutException, httpx.NetworkError) as e:
-            elapsed_ms = int((time.perf_counter() - t0) * 1000)
-            last_exc = e
-            log.warning(f"Notion network/timeout attempt={attempt}/{max_attempts} time={elapsed_ms}ms err={e}")
-
-            if attempt < max_attempts:
-                delay = min(base_delay * (2 ** (attempt - 1)), 8.0) + random.uniform(0.0, 0.35)
-                await asyncio.sleep(delay)
-                continue
-            raise
-
+        except (httpx.TimeoutException, httpx.TransportError) as e:
+            last_err = e
+            sleep_s = base_delay * (2 ** (attempt - 1))
+            log.warning("Notion query network/timeout: %r attempt=%s/%s sleep=%.2fs", e, attempt, max_attempts, sleep_s)
+            await asyncio.sleep(sleep_s)
         except httpx.HTTPStatusError as e:
-            last_exc = e
-            log.warning(f"Notion HTTPStatusError attempt={attempt}/{max_attempts}: {e}")
+            last_err = e
+            # другие статус-коды не ретраим (обычно ошибка запроса)
+            log.error("Notion query HTTPStatusError: %s", str(e))
             raise
-
         except Exception as e:
-            last_exc = e
-            log.exception(f"Unexpected Notion error attempt={attempt}/{max_attempts}: {e}")
+            last_err = e
+            log.error("Notion query unknown error: %r", e)
             raise
 
-    # на всякий случай
-    raise last_exc if last_exc else RuntimeError("Notion query failed")
+    log.error("Notion query failed after %s attempts: %r", max_attempts, last_err)
+    raise last_err
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
@@ -269,17 +283,21 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
     try:
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
-    except TelegramNetworkError as e:
-        log.warning(f"TelegramNetworkError on photo: {e}")
+    except TelegramNetworkError:
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
-    except Exception as e:
-        log.exception(f"send_photo_safe error: {e}")
+    except Exception:
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
 
 
 def tally_confirm_kb(tally_url: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Подтверждение оплаты", web_app=WebAppInfo(url=tally_url))]
+    ])
+
+
+def mentoring_apply_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оставить заявку", web_app=WebAppInfo(url=MENTORING_TALLY_URL))]
     ])
 
 
@@ -379,10 +397,9 @@ def kb_community_buy() -> InlineKeyboardMarkup:
     ])
 
 
-def kb_mentoring_buy() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Приобрести", callback_data="buy:mentoring")]
-    ])
+def kb_mentoring_apply() -> InlineKeyboardMarkup:
+    # вместо "Приобрести" -> "Оставить заявку" и сразу в Tally
+    return mentoring_apply_kb()
 
 
 def kb_payment_methods(product_key: str) -> InlineKeyboardMarkup:
@@ -410,20 +427,6 @@ def kb_community_fiat_periods() -> InlineKeyboardMarkup:
     ])
 
 
-def kb_mentoring_crypto() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="3000 USDT", callback_data="sub:mentoring:crypto:once")],
-        [InlineKeyboardButton(text="Закрыть", callback_data="close")],
-    ])
-
-
-def kb_mentoring_fiat() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="130000 UAH", callback_data="sub:mentoring:fiat:once")],
-        [InlineKeyboardButton(text="Закрыть", callback_data="close")],
-    ])
-
-
 def cabinet_refresh_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Обновить", callback_data="cabinet:refresh")]
@@ -442,64 +445,62 @@ WELCOME_TEXT = (
     f"Если возникнут вопросы — напишите администратору {ADMIN_USERNAME}."
 )
 
+CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
+
+
 # =========================
-# CABINET TEXT BUILDER (UPDATED FORMAT)
+# CABINET TEXT BUILDER (UPDATED)
 # =========================
 
 async def build_cabinet_text(user_id: int) -> str:
-    """
-    Формат:
-    Discord: ...
-    Email: ...
-
-    <b>Заявка ...</b>
-    или
-    <b>Подписка активна до: ...</b>
-    """
+    # дефолты
     discord = "Не указан"
     email = "Не указан"
-    status_line = "Нет активной подписки"
 
     page = await get_latest_request_for_user(user_id)
+    if not page:
+        # без заголовка "👤 Личный кабинет" (как ты просил)
+        return (
+            f"Discord: {discord}\n"
+            f"Email: {email}\n\n"
+            "Нет активной подписки"
+        )
 
-    if page:
-        props = page.get("properties", {})
+    props = page.get("properties", {})
+    st = _status_name(props, "status")
 
-        # ✅ показываем введённые discord/email при ЛЮБОМ статусе
-        d = _rt_plain(props, "discord")
-        e = _rt_plain(props, "email")
-        if d:
-            discord = d
-        if e:
-            email = e
+    # показываем то, что пользователь оставил, для ЛЮБОГО статуса
+    d = _rt_plain(props, "discord")
+    e = _rt_plain(props, "email")
+    if d:
+        discord = d
+    if e:
+        email = e
 
-        st = _status_name(props, "status")
-        expires_raw = _rt_plain(props, "expires_at")
-        expires_dt = _parse_expires(expires_raw)
+    expires_raw = _rt_plain(props, "expires_at")
+    expires_dt = _parse_expires(expires_raw)
 
-        if st == "pending":
-            status_line = "Заявка на проверке"
-        elif st == "rejected":
-            status_line = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
-        elif st == "approved":
-            if expires_dt:
-                if expires_dt >= date.today():
-                    status_line = f"Подписка активна до: {expires_dt.isoformat()}"
-                else:
-                    status_line = f"Подписка истекла: {expires_dt.isoformat()}"
+    # тексты без "Статус:"
+    if st == "pending":
+        status_line = "Заявка на проверке"
+    elif st == "rejected":
+        status_line = f"Заявка отклонена. Свяжитесь с администратором: <b>{ADMIN_USERNAME}</b>"
+    elif st == "approved":
+        if expires_dt:
+            if expires_dt >= date.today():
+                status_line = f"<b>Подписка активна до: {expires_dt.isoformat()}</b>"
             else:
-                status_line = "Подписка активна"
+                status_line = f"<b>Подписка истекла: {expires_dt.isoformat()}</b>"
         else:
-            # неизвестный/пустой статус — считаем как “на проверке”
-            status_line = "Заявка на проверке"
+            status_line = "<b>Подписка активна</b>"
+    else:
+        status_line = "Заявка на проверке"
 
-    # ✅ Убрали “👤 Личный кабинет”
-    # ✅ Discord/Email НЕ жирные
-    # ✅ “Статус:” убрали, статус отдельной строкой жирным
+    # без жирного для discord/email
     return (
         f"Discord: {discord}\n"
         f"Email: {email}\n\n"
-        f"<b>{status_line}</b>"
+        f"{status_line}"
     )
 
 
@@ -507,21 +508,20 @@ async def send_cabinet(message: Message, user_id: int):
     """
     Единая функция отправки кабинета с кнопкой "Обновить".
     """
-    log.info(f"Cabinet tapped. user_id={user_id}")
-    t0 = time.perf_counter()
-
     try:
+        t0 = time.perf_counter()
+        log.info("Cabinet tapped. user_id=%s", user_id)
+
         text = await build_cabinet_text(user_id)
+
+        dt_ms = int((time.perf_counter() - t0) * 1000)
+        log.info("Cabinet build OK (%sms). user_id=%s", dt_ms, user_id)
+
         await safe_answer(message, text, reply_markup=cabinet_refresh_kb())
-        ms = int((time.perf_counter() - t0) * 1000)
-        log.info(f"Cabinet sent OK. user_id={user_id} time={ms}ms")
-    except (httpx.TimeoutException, TelegramNetworkError) as e:
-        ms = int((time.perf_counter() - t0) * 1000)
-        log.warning(f"Cabinet timeout/network. user_id={user_id} time={ms}ms err={e}")
+    except (httpx.TimeoutException, TelegramNetworkError):
         await safe_answer(message, CABINET_RETRY_TEXT)
     except Exception as e:
-        ms = int((time.perf_counter() - t0) * 1000)
-        log.exception(f"Cabinet error. user_id={user_id} time={ms}ms err={e}")
+        log.exception("Cabinet error user_id=%s", user_id)
         await safe_answer(message, f"Ошибка кабинета: {e}")
 
 
@@ -578,7 +578,8 @@ async def community_info(message: Message):
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
-    await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_buy())
+    # текст как сейчас + вместо "Приобрести" -> "Оставить заявку" и сразу в Tally
+    await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
 
 
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
@@ -588,64 +589,69 @@ async def cabinet_from_menu(message: Message):
 
 @dp.callback_query(F.data == "cabinet:refresh")
 async def cabinet_refresh(cb: CallbackQuery):
-    user_id = cb.from_user.id
-    log.info(f"Cabinet refresh clicked. user_id={user_id}")
-
-    # удаляем старое сообщение с кабинетом и присылаем новое
     try:
         await cb.message.delete()
-    except Exception as e:
-        log.warning(f"Could not delete cabinet message: {e}")
+    except Exception:
+        pass
 
-    await send_cabinet(cb.message, user_id)
-    await cb.answer()  # убрать "loading"
+    await send_cabinet(cb.message, cb.from_user.id)
+    await safe_cb_answer(cb)
 
 
 # --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
-    await cb.message.delete()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
     await send_photo_safe(
         cb.message,
         PAYMENT_IMAGE_PATH,
         caption="Выберите способ оплаты",
         reply_markup=kb_payment_methods("community"),
     )
-    await cb.answer()
+    await safe_cb_answer(cb)
 
 
+# На всякий случай: если где-то остались старые сообщения с callback buy:mentoring — не ломаемся.
 @dp.callback_query(F.data == "buy:mentoring")
-async def buy_mentoring(cb: CallbackQuery):
-    await cb.message.delete()
-    await send_photo_safe(
-        cb.message,
-        PAYMENT_IMAGE_PATH,
-        caption="Выберите способ оплаты",
-        reply_markup=kb_payment_methods("mentoring"),
-    )
-    await cb.answer()
+async def buy_mentoring_legacy(cb: CallbackQuery):
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+
+    await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+    await safe_cb_answer(cb)
 
 
 @dp.callback_query(F.data.startswith("pm:"))
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
 
+    # mentoring больше НЕ проходит через оплату/сроки
+    if product_key == "mentoring":
+        await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+        await safe_cb_answer(cb)
+        return
+
     if product_key == "community" and method == "crypto":
         await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_crypto_periods())
     elif product_key == "community" and method == "fiat":
         await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_community_fiat_periods())
-    elif product_key == "mentoring" and method == "crypto":
-        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_crypto())
-    elif product_key == "mentoring" and method == "fiat":
-        await send_photo_safe(cb.message, SUBSCRIPTION_IMAGE_PATH, "Выберите срок подписки", kb_mentoring_fiat())
 
-    await cb.answer()
+    await safe_cb_answer(cb)
 
 
 @dp.callback_query(F.data == "close")
 async def close_message(cb: CallbackQuery):
-    await cb.message.delete()
-    await cb.answer()
+    try:
+        await cb.message.delete()
+    except Exception:
+        pass
+    await safe_cb_answer(cb)
 
 
 @dp.callback_query(F.data.startswith("sub:"))
@@ -654,6 +660,12 @@ async def subscription_selected(cb: CallbackQuery):
 
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
+
+    # mentoring больше НЕ проходит через оплату/сроки
+    if product_key == "mentoring":
+        await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+        await safe_cb_answer(cb)
+        return
 
     if product_key == "community":
         product_name = "Hadiukov Community"
@@ -690,37 +702,7 @@ async def subscription_selected(cb: CallbackQuery):
                 expires_at=expires_at,
             )
 
-    elif product_key == "mentoring":
-        product_name = "Hadiukov Mentoring"
-
-        if method == "crypto":
-            await send_payment_flow_final(
-                cb.message,
-                tg_id=user_id,
-                tg_username=user_username,
-                product=product_name,
-                pay_method="Crypto (USDT)",
-                currency="USDT",
-                amount=MENTORING_USDT,
-                period_key="mentoring",
-                period_text="Mentoring",
-                expires_at="",
-            )
-        else:
-            await send_payment_flow_final(
-                cb.message,
-                tg_id=user_id,
-                tg_username=user_username,
-                product=product_name,
-                pay_method="Fiat (UAH)",
-                currency="UAH",
-                amount=MENTORING_UAH,
-                period_key="mentoring",
-                period_text="Mentoring",
-                expires_at="",
-            )
-
-    await cb.answer()
+    await safe_cb_answer(cb)
 
 
 # =========================
@@ -730,6 +712,7 @@ async def subscription_selected(cb: CallbackQuery):
 async def main():
     log.info("Bot starting polling...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
