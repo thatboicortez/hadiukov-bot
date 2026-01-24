@@ -1,8 +1,8 @@
 import uuid
 import asyncio
-import time
-import random
 import logging
+import random
+import time
 from datetime import datetime, date
 from urllib.parse import urlencode, quote
 
@@ -22,12 +22,14 @@ from aiogram.types import (
     FSInputFile,
 )
 from aiogram.exceptions import TelegramNetworkError
+from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, TALLY_FORM_URL, NOTION_TOKEN, NOTION_DATABASE_ID
 
 # =========================
 # LOGGING
 # =========================
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -66,11 +68,14 @@ MENTORING_UAH = 130000
 PERIOD_TEXT = {"1m": "1 month", "3m": "3 months"}
 PERIOD_MONTHS = {"1m": 1, "3m": 3}
 
+CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
+
 # =========================
 # BOT INIT
 # =========================
 
-bot = Bot(BOT_TOKEN, parse_mode="HTML")
+# ✅ убираем warning про parse_mode и делаем по-правильному
+bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()
 
 # =========================
@@ -82,43 +87,34 @@ async def safe_answer(message: Message, text: str, *, reply_markup=None, retries
     Надёжная отправка сообщений: если Telegram временно не отвечает, пробуем ещё раз.
     Если совсем плохо — просто молча не падаем.
     """
-    for attempt in range(1, retries + 1):
+    for attempt in range(retries):
         try:
             return await message.answer(text, reply_markup=reply_markup)
         except TelegramNetworkError as e:
-            log.warning(f"TelegramNetworkError on answer (attempt {attempt}/{retries}): {e}")
+            log.warning(f"TelegramNetworkError on answer (attempt {attempt+1}/{retries}): {e}")
             await asyncio.sleep(1.0)
+        except Exception as e:
+            log.exception(f"Unexpected error in safe_answer: {e}")
+            return None
     return None  # не валим процесс
 
 
 # =========================
-# NOTION (READ ONLY) + RETRY / BACKOFF
+# NOTION (READ ONLY) + RETRIES/BACKOFF
 # =========================
 
 NOTION_API_BASE = "https://api.notion.com/v1"
 NOTION_VERSION = "2022-06-28"
 
-# Настройки ретраев на Notion
-NOTION_MAX_ATTEMPTS = 4                 # 1..4
-NOTION_BASE_DELAY = 0.6                 # стартовая пауза (сек)
-NOTION_MAX_DELAY = 6.0                  # максимум паузы (сек)
-NOTION_TIMEOUT = 60                     # таймаут запроса (сек)
 
-
-def _backoff_delay(attempt: int) -> float:
-    """
-    attempt: 1..N
-    Экспоненциальная задержка + джиттер.
-    """
-    exp = NOTION_BASE_DELAY * (2 ** (attempt - 1))
-    jitter = random.uniform(0.0, 0.25)
-    return min(NOTION_MAX_DELAY, exp + jitter)
+def _should_retry_notion(status_code: int) -> bool:
+    # 429 = rate limit, 5xx = временные сбои
+    return status_code in (429, 500, 502, 503, 504)
 
 
 async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
     """
-    Query Notion DB с ретраями/backoff.
-    Ретраим: Timeout/Connect/ReadError + HTTP 429 + HTTP 5xx
+    Query Notion DB с ретраями + экспоненциальным backoff + jitter.
     """
     url = f"{NOTION_API_BASE}/databases/{NOTION_DATABASE_ID}/query"
     headers = {
@@ -132,61 +128,67 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10) -> dict:
         "sorts": [{"timestamp": "created_time", "direction": "descending"}],
     }
 
-    last_exc = None
-    started = time.perf_counter()
+    max_attempts = 4
+    base_delay = 0.7  # сек
+    timeout = httpx.Timeout(60.0)
 
-    for attempt in range(1, NOTION_MAX_ATTEMPTS + 1):
+    last_exc = None
+
+    for attempt in range(1, max_attempts + 1):
         t0 = time.perf_counter()
         try:
-            log.info(f"Notion query start (attempt {attempt}/{NOTION_MAX_ATTEMPTS})")
-            async with httpx.AsyncClient(timeout=NOTION_TIMEOUT) as client:
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(url, headers=headers, json=payload)
 
-            # Обработка rate limit / временных ошибок
-            if r.status_code == 429:
-                retry_after = r.headers.get("Retry-After")
-                wait = float(retry_after) if retry_after and retry_after.isdigit() else _backoff_delay(attempt)
-                log.warning(f"Notion 429 Too Many Requests. Wait {wait:.2f}s and retry...")
-                await asyncio.sleep(wait)
-                continue
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
+            log.info(f"Notion query attempt={attempt}/{max_attempts} status={r.status_code} time={elapsed_ms}ms")
 
-            if 500 <= r.status_code < 600:
-                wait = _backoff_delay(attempt)
-                log.warning(f"Notion {r.status_code} server error. Wait {wait:.2f}s and retry...")
-                await asyncio.sleep(wait)
-                continue
+            if r.status_code >= 400:
+                # если это "временная" ошибка — ретраим
+                if _should_retry_notion(r.status_code) and attempt < max_attempts:
+                    # если Notion прислал Retry-After — уважаем, но всё равно добавим чуть jitter
+                    retry_after = r.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except Exception:
+                            delay = base_delay * (2 ** (attempt - 1))
+                    else:
+                        delay = base_delay * (2 ** (attempt - 1))
 
-            r.raise_for_status()
+                    delay = min(delay, 8.0) + random.uniform(0.0, 0.35)
+                    log.warning(f"Notion retryable status={r.status_code}, sleeping {delay:.2f}s")
+                    await asyncio.sleep(delay)
+                    continue
 
-            dt_ms = (time.perf_counter() - t0) * 1000
-            total_ms = (time.perf_counter() - started) * 1000
-            log.info(f"Notion query OK ({dt_ms:.1f}ms). Total {total_ms:.1f}ms.")
+                # иначе — бросаем как есть
+                r.raise_for_status()
+
             return r.json()
 
-        except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            elapsed_ms = int((time.perf_counter() - t0) * 1000)
             last_exc = e
-            wait = _backoff_delay(attempt)
-            log.warning(f"Notion network/timeout error: {e}. Wait {wait:.2f}s (attempt {attempt}/{NOTION_MAX_ATTEMPTS})")
-            await asyncio.sleep(wait)
-            continue
+            log.warning(f"Notion network/timeout attempt={attempt}/{max_attempts} time={elapsed_ms}ms err={e}")
+
+            if attempt < max_attempts:
+                delay = min(base_delay * (2 ** (attempt - 1)), 8.0) + random.uniform(0.0, 0.35)
+                await asyncio.sleep(delay)
+                continue
+            raise
 
         except httpx.HTTPStatusError as e:
-            # 4xx кроме 429 — обычно это не "временно", ретраить бессмысленно
             last_exc = e
-            status = e.response.status_code if e.response else "unknown"
-            log.error(f"Notion HTTPStatusError (status={status}): {e}")
+            log.warning(f"Notion HTTPStatusError attempt={attempt}/{max_attempts}: {e}")
             raise
 
         except Exception as e:
             last_exc = e
-            log.exception(f"Notion unexpected error: {e}")
+            log.exception(f"Unexpected Notion error attempt={attempt}/{max_attempts}: {e}")
             raise
 
-    # Если дошли сюда — все попытки исчерпаны
-    total_ms = (time.perf_counter() - started) * 1000
-    log.error(f"Notion query FAILED after {NOTION_MAX_ATTEMPTS} attempts. Total {total_ms:.1f}ms. Last={last_exc}")
-    # Пробрасываем как таймаут, чтобы в кабинете показать CABINET_RETRY_TEXT
-    raise httpx.TimeoutException(f"Notion request failed after retries: {last_exc}")
+    # на всякий случай
+    raise last_exc if last_exc else RuntimeError("Notion query failed")
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
@@ -268,10 +270,10 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
         photo = FSInputFile(path)
         await message.answer_photo(photo=photo, caption=caption, reply_markup=reply_markup)
     except TelegramNetworkError as e:
-        log.warning(f"TelegramNetworkError on send_photo: {e}")
+        log.warning(f"TelegramNetworkError on photo: {e}")
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
     except Exception as e:
-        log.warning(f"send_photo_safe error: {e}")
+        log.exception(f"send_photo_safe error: {e}")
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
 
 
@@ -440,52 +442,64 @@ WELCOME_TEXT = (
     f"Если возникнут вопросы — напишите администратору {ADMIN_USERNAME}."
 )
 
-CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
-
-
 # =========================
-# CABINET TEXT BUILDER
+# CABINET TEXT BUILDER (UPDATED FORMAT)
 # =========================
 
 async def build_cabinet_text(user_id: int) -> str:
+    """
+    Формат:
+    Discord: ...
+    Email: ...
+
+    <b>Заявка ...</b>
+    или
+    <b>Подписка активна до: ...</b>
+    """
     discord = "Не указан"
     email = "Не указан"
-    status_text = "Нет активной подписки"
+    status_line = "Нет активной подписки"
 
     page = await get_latest_request_for_user(user_id)
+
     if page:
         props = page.get("properties", {})
+
+        # ✅ показываем введённые discord/email при ЛЮБОМ статусе
+        d = _rt_plain(props, "discord")
+        e = _rt_plain(props, "email")
+        if d:
+            discord = d
+        if e:
+            email = e
+
         st = _status_name(props, "status")
         expires_raw = _rt_plain(props, "expires_at")
         expires_dt = _parse_expires(expires_raw)
 
         if st == "pending":
-            status_text = "Заявка на проверке"
+            status_line = "Заявка на проверке"
         elif st == "rejected":
-            status_text = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
+            status_line = f"Заявка отклонена. Свяжитесь с администратором: {ADMIN_USERNAME}"
         elif st == "approved":
-            d = _rt_plain(props, "discord")
-            e = _rt_plain(props, "email")
-            if d:
-                discord = d
-            if e:
-                email = e
-
             if expires_dt:
                 if expires_dt >= date.today():
-                    status_text = f"Активна до: {expires_dt.isoformat()}"
+                    status_line = f"Подписка активна до: {expires_dt.isoformat()}"
                 else:
-                    status_text = f"Подписка истекла: {expires_dt.isoformat()}"
+                    status_line = f"Подписка истекла: {expires_dt.isoformat()}"
             else:
-                status_text = "Активна (дата не указана)"
+                status_line = "Подписка активна"
         else:
-            status_text = "Заявка на проверке"
+            # неизвестный/пустой статус — считаем как “на проверке”
+            status_line = "Заявка на проверке"
 
+    # ✅ Убрали “👤 Личный кабинет”
+    # ✅ Discord/Email НЕ жирные
+    # ✅ “Статус:” убрали, статус отдельной строкой жирным
     return (
-        "👤 Личный кабинет\n\n"
-        f"Discord: <b>{discord}</b>\n"
-        f"Email: <b>{email}</b>\n\n"
-        f"Статус: <b>{status_text}</b>"
+        f"Discord: {discord}\n"
+        f"Email: {email}\n\n"
+        f"<b>{status_line}</b>"
     )
 
 
@@ -495,18 +509,19 @@ async def send_cabinet(message: Message, user_id: int):
     """
     log.info(f"Cabinet tapped. user_id={user_id}")
     t0 = time.perf_counter()
+
     try:
         text = await build_cabinet_text(user_id)
         await safe_answer(message, text, reply_markup=cabinet_refresh_kb())
-        dt_ms = (time.perf_counter() - t0) * 1000
-        log.info(f"Cabinet build OK ({dt_ms:.1f}ms). user_id={user_id}")
+        ms = int((time.perf_counter() - t0) * 1000)
+        log.info(f"Cabinet sent OK. user_id={user_id} time={ms}ms")
     except (httpx.TimeoutException, TelegramNetworkError) as e:
-        dt_ms = (time.perf_counter() - t0) * 1000
-        log.warning(f"Cabinet failed (timeout/telegram) ({dt_ms:.1f}ms). user_id={user_id}. err={e}")
+        ms = int((time.perf_counter() - t0) * 1000)
+        log.warning(f"Cabinet timeout/network. user_id={user_id} time={ms}ms err={e}")
         await safe_answer(message, CABINET_RETRY_TEXT)
     except Exception as e:
-        dt_ms = (time.perf_counter() - t0) * 1000
-        log.exception(f"Cabinet unexpected error ({dt_ms:.1f}ms). user_id={user_id}. err={e}")
+        ms = int((time.perf_counter() - t0) * 1000)
+        log.exception(f"Cabinet error. user_id={user_id} time={ms}ms err={e}")
         await safe_answer(message, f"Ошибка кабинета: {e}")
 
 
@@ -580,7 +595,7 @@ async def cabinet_refresh(cb: CallbackQuery):
     try:
         await cb.message.delete()
     except Exception as e:
-        log.warning(f"Cabinet refresh: failed to delete message: {e}")
+        log.warning(f"Could not delete cabinet message: {e}")
 
     await send_cabinet(cb.message, user_id)
     await cb.answer()  # убрать "loading"
@@ -637,7 +652,6 @@ async def close_message(cb: CallbackQuery):
 async def subscription_selected(cb: CallbackQuery):
     _, product_key, method, choice = cb.data.split(":")
 
-    # ВАЖНО: cb.from_user — это реальный пользователь
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
