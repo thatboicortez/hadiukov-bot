@@ -48,6 +48,7 @@ TELEGRAM_URL = "https://t.me/hadiukov"
 MENTORING_TALLY_URL = "https://tally.so/r/68KqNN"
 
 # Images (пути в репо)
+COMMUNITY_IMAGE_PATH = "pictures/community.png"
 RESOURCES_IMAGE_PATH = "pictures/resources.png"
 PRODUCTS_IMAGE_PATH = "pictures/products.png"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
@@ -573,7 +574,26 @@ async def products_entry(message: Message):
 
 @dp.message(F.text == "Hadiukov Community")
 async def community_info(message: Message):
-    await safe_answer(message, "Объяснение внутрянки сервера", reply_markup=kb_community_buy())
+    await send_photo_safe(
+        message,
+        COMMUNITY_IMAGE_PATH,
+        caption= """Я ежедневно выполняю свою рутину – торговые планы, аналитика, статистика, сделки.
+В Discord я просто делюсь этим процессом в реальном времени, без задержек и в спокойной обстановке.
+
+Это не обучение и не “инфо-помойка”. Нет десятков веток, методичек и бесконечных уроков. Сервер собран только под практику. Я показываю, как сам работаю.
+
+Внутри – рутинная работа и поддержка среды:
+• анализ графиков
+• бэктесты
+• итоги недели / месяца / квартала
+• стримы с ответами на вопросы
+• разбор рыночных ситуаций
+• развитие сильного майнд-сета
+
+Суть сервера – выстроить рабочий алгоритм и быть в адекватной среде, где все нацелены на результат и процесс.""",
+        reply_markup=kb_community_buy(),
+    )
+
 
 
 @dp.message(F.text == "Hadiukov Mentoring")
