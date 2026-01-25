@@ -49,11 +49,12 @@ MENTORING_TALLY_URL = "https://tally.so/r/68KqNN"
 
 # Images (пути в репо)
 COMMUNITY_IMAGE_PATH = "pictures/community.png"
+MENTORING_IMAGE_PATH = "pictures/mentoring.png"
 RESOURCES_IMAGE_PATH = "pictures/resources.png"
 PRODUCTS_IMAGE_PATH = "pictures/products.png"
 PAYMENT_IMAGE_PATH = "pictures/payment.png"
 SUBSCRIPTION_IMAGE_PATH = "pictures/subscription.png"
-SUPPORT_IMAGE_PATH = "pictures/support.png"  # <-- добавили
+SUPPORT_IMAGE_PATH = "pictures/support.png"
 
 # Wallet
 USDT_TRC20_ADDRESS = "TX5VC5qAprsWcnCSSdgZGXtQMFD2JjVLyK"
@@ -128,7 +129,6 @@ async def safe_cb_answer(cb: CallbackQuery, *, retries: int = 3):
             break
     log.error("safe_cb_answer failed: %r", last_err)
 
-
 # =========================
 # NOTION (READ ONLY)
 # =========================
@@ -169,7 +169,6 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10, max_attem
 
             dt_ms = int((time.perf_counter() - t0) * 1000)
 
-            # ретраи на 429 / 5xx
             if r.status_code == 429 or 500 <= r.status_code <= 599:
                 retry_after = r.headers.get("Retry-After")
                 if retry_after:
@@ -207,9 +206,6 @@ async def notion_query_database(filter_obj: dict, page_size: int = 10, max_attem
 
 
 def _rt_plain(props: dict, prop_name: str) -> str:
-    """
-    Читает Notion Text (rich_text) как строку.
-    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -222,10 +218,6 @@ def _rt_plain(props: dict, prop_name: str) -> str:
 
 
 def _status_name(props: dict, prop_name: str = "status") -> str:
-    """
-    Читает Notion Status как name.
-    Если вдруг сделаешь status обычным Text — тоже отработает (через rich_text).
-    """
     p = (props or {}).get(prop_name)
     if not p:
         return ""
@@ -242,9 +234,6 @@ def _status_name(props: dict, prop_name: str = "status") -> str:
 
 
 def _parse_expires(expires_at_str: str) -> date | None:
-    """
-    expires_at хранится как TEXT 'YYYY-MM-DD'
-    """
     if not expires_at_str:
         return None
     try:
@@ -254,15 +243,11 @@ def _parse_expires(expires_at_str: str) -> date | None:
 
 
 async def get_latest_request_for_user(tg_id: int) -> dict | None:
-    """
-    Берём ПОСЛЕДНЮЮ заявку пользователя (любого статуса).
-    """
     tg_id_str = str(tg_id)
     filter_obj = {"property": "tg_id", "rich_text": {"equals": tg_id_str}}
     data = await notion_query_database(filter_obj, page_size=10)
     results = data.get("results", [])
     return results[0] if results else None
-
 
 # =========================
 # HELPERS
@@ -287,6 +272,7 @@ async def send_photo_safe(message: Message, path: str, caption: str | None = Non
     except TelegramNetworkError:
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
     except Exception:
+        # если файла нет/ошибка чтения — просто отправим текст
         await safe_answer(message, caption or " ", reply_markup=reply_markup)
 
 
@@ -303,9 +289,9 @@ def mentoring_apply_kb() -> InlineKeyboardMarkup:
 
 
 def admin_contact_kb() -> InlineKeyboardMarkup:
-    admin = ADMIN_USERNAME.lstrip("@")
+    admin_link = f"https://t.me/{ADMIN_USERNAME.lstrip('@')}"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Написать", url=f"https://t.me/{admin}")]
+        [InlineKeyboardButton(text="Написать", url=admin_link)]
     ])
 
 
@@ -352,7 +338,6 @@ async def send_payment_flow_final(
         await safe_answer(message, f"Для оплаты Вам необходимо перевести {amount} грн на указанные реквизиты:")
         await safe_answer(message, "Скоро добавим карту.", reply_markup=kb)
 
-
 # =========================
 # KEYBOARDS
 # =========================
@@ -369,7 +354,7 @@ def main_menu_kb() -> ReplyKeyboardMarkup:
     )
 
 
-def resources_back_kb() -> ReplyKeyboardMarkup:
+def back_only_kb() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[[KeyboardButton(text="В главное меню")]],
         resize_keyboard=True,
@@ -405,10 +390,6 @@ def kb_community_buy() -> InlineKeyboardMarkup:
     ])
 
 
-def kb_mentoring_apply() -> InlineKeyboardMarkup:
-    return mentoring_apply_kb()
-
-
 def kb_payment_methods(product_key: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -439,7 +420,6 @@ def cabinet_refresh_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Обновить", callback_data="cabinet:refresh")]
     ])
 
-
 # =========================
 # TEXTS
 # =========================
@@ -449,18 +429,31 @@ WELCOME_TEXT = (
     "Сейчас вы находитесь в официальном боте проекта.\n"
     "Здесь вы можете оформить или продлить подписку и отправить подтверждение оплаты.\n\n"
     "Выберите нужный раздел в меню снизу 👇\n"
-    f"Если возникнут вопросы – напишите администратору {ADMIN_USERNAME}."
+    f"Если возникнут вопросы — напишите администратору {ADMIN_USERNAME}."
 )
 
 CABINET_RETRY_TEXT = "⏳ Подожди 10–20 секунд и нажми «Личный кабинет» ещё раз."
 
 HELP_TEXT = (
-    "Если что-то непонятно при оформлении подписки или оплате — напишите администратору.\n"
-    "Он поможет разобраться и подскажет, что делать дальше."
+    "Если что-то непонятно при оформлении подписки или оплате – "
+    "просто напишите администратору, он поможет разобраться и подскажет, что делать дальше."
 )
 
+MENTORING_TEXT = """Я открываю формат личного сопровождения 1 на 1.
+
+Это работа для тех, кто готов серьезно вкладываться в процесс и наводить порядок в торговле — без хаоса и угадываний.
+
+Как проходит работа:
+• разбираем твою текущую систему и находим, что реально даёт результат, а что мешает;
+• выстраиваем понятный алгоритм: план → исполнение → разбор → корректировки;
+• усиливаем дисциплину и устойчивость (самые дорогие ошибки почти всегда не в “технике”);
+• постоянно анализируем сделки и динамику, чтобы закреплять прогресс.
+
+Если хочешь понять детали формата, условия и подходит ли тебе — оставь заявку.
+"""
+
 # =========================
-# CABINET TEXT BUILDER (UPDATED)
+# CABINET TEXT BUILDER
 # =========================
 
 async def build_cabinet_text(user_id: int) -> str:
@@ -527,6 +520,18 @@ async def send_cabinet(message: Message, user_id: int):
         log.exception("Cabinet error user_id=%s", user_id)
         await safe_answer(message, f"Ошибка кабинета: {e}")
 
+# =========================
+# SHARED SENDER: MENTORING
+# =========================
+
+async def send_mentoring_info(message: Message):
+    # картинка + текст + кнопка "Оставить заявку"
+    await send_photo_safe(
+        message,
+        MENTORING_IMAGE_PATH,
+        caption=MENTORING_TEXT,
+        reply_markup=mentoring_apply_kb(),
+    )
 
 # =========================
 # HANDLERS
@@ -549,7 +554,9 @@ async def back_to_main_menu(message: Message):
 
 @dp.message(lambda m: "Информация" in (m.text or ""))
 async def info_from_menu(message: Message):
-    await safe_answer(message, """Hadiukov Community – это среда, где результат строится на дисциплине, ясной системе и умении подстраиваться под рынок.
+    await safe_answer(
+        message,
+        """Hadiukov Community – это среда, где результат строится на дисциплине, ясной системе и умении подстраиваться под рынок.
 
 Мы не ищем «секретные кнопки» и не торгуем эмоциями. Здесь фокус на том, что реально повышает качество трейдинга:
  • понятная логика работы с движением цены и контекстом;
@@ -559,25 +566,22 @@ async def info_from_menu(message: Message):
 
 Этот подход помогает выстроить профессиональную базу: видеть, что именно приносит деньги, что тянет вниз, и как шаг за шагом усиливать свой перформанс без хаоса и угадываний.
 
-Если тебе близка торговля как работа, а не как азарт – добро пожаловать в Hadiukov Community.""")
+Если тебе близка торговля как работа, а не как азарт – добро пожаловать в Hadiukov Community.""",
+        reply_markup=back_only_kb(),
+    )
 
 
 @dp.message(lambda m: "Помощь" in (m.text or ""))
 async def help_from_menu(message: Message):
-    # 1) Фото + подпись (caption) + inline кнопка "Написать"
+    # 1) Сообщение с кнопкой "Написать" (инлайн)
     await send_photo_safe(
         message,
         SUPPORT_IMAGE_PATH,
         caption=HELP_TEXT,
         reply_markup=admin_contact_kb(),
     )
-
     # 2) Меняем нижнюю клавиатуру на одну кнопку "В главное меню"
-    await safe_answer(
-        message,
-        "Чтобы вернуться, нажмите «В главное меню».",
-        reply_markup=resources_back_kb(),
-    )
+    await safe_answer(message, "Чтобы вернуться, нажмите «В главное меню».", reply_markup=back_only_kb())
 
 
 @dp.message(lambda m: "Мои ресурсы" in (m.text or ""))
@@ -588,7 +592,7 @@ async def resources_from_menu(message: Message):
         caption="Подписывайтесь ⬇️⬇️⬇️",
         reply_markup=resources_links_kb(),
     )
-    await safe_answer(message, "Чтобы вернуться, нажмите «В главное меню».", reply_markup=resources_back_kb())
+    await safe_answer(message, "Чтобы вернуться, нажмите «В главное меню».", reply_markup=back_only_kb())
 
 
 @dp.message(lambda m: "Мои продукты" in (m.text or ""))
@@ -622,7 +626,7 @@ async def community_info(message: Message):
 
 @dp.message(F.text == "Hadiukov Mentoring")
 async def mentoring_info(message: Message):
-    await safe_answer(message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+    await send_mentoring_info(message)
 
 
 @dp.message(lambda m: "Личный кабинет" in (m.text or ""))
@@ -641,6 +645,7 @@ async def cabinet_refresh(cb: CallbackQuery):
     await safe_cb_answer(cb)
 
 
+# --- Inline: Buy / Acquire ---
 @dp.callback_query(F.data == "buy:community")
 async def buy_community(cb: CallbackQuery):
     try:
@@ -657,14 +662,14 @@ async def buy_community(cb: CallbackQuery):
     await safe_cb_answer(cb)
 
 
+# Legacy-страховка: если где-то остались старые кнопки buy:mentoring
 @dp.callback_query(F.data == "buy:mentoring")
 async def buy_mentoring_legacy(cb: CallbackQuery):
     try:
         await cb.message.delete()
     except Exception:
         pass
-
-    await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+    await send_mentoring_info(cb.message)
     await safe_cb_answer(cb)
 
 
@@ -672,8 +677,9 @@ async def buy_mentoring_legacy(cb: CallbackQuery):
 async def payment_method_choice(cb: CallbackQuery):
     _, product_key, method = cb.data.split(":")
 
+    # mentoring больше НЕ проходит через оплату/сроки
     if product_key == "mentoring":
-        await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+        await send_mentoring_info(cb.message)
         await safe_cb_answer(cb)
         return
 
@@ -701,8 +707,9 @@ async def subscription_selected(cb: CallbackQuery):
     user_id = cb.from_user.id
     user_username = cb.from_user.username or ""
 
+    # mentoring больше НЕ проходит через оплату/сроки
     if product_key == "mentoring":
-        await safe_answer(cb.message, "Объяснение того что будет на менторке", reply_markup=kb_mentoring_apply())
+        await send_mentoring_info(cb.message)
         await safe_cb_answer(cb)
         return
 
@@ -742,7 +749,6 @@ async def subscription_selected(cb: CallbackQuery):
             )
 
     await safe_cb_answer(cb)
-
 
 # =========================
 # RUN
